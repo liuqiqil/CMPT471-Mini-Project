@@ -16,7 +16,7 @@ BACKEND_SERVERS: List[Tuple[str, int, str]] = [
     ("127.0.0.1", 8002, "Server2"),
 ]
 
-# Simple session map: client_id -> backend
+# Simple session map
 SESSION_MAP: Dict[str, Tuple[str, int, str]] = {}
 
 # Round-robin pointer for new clients
@@ -61,10 +61,10 @@ def make_json_response(
 
 
 def choose_backends_for_client(client_id: str) -> List[Tuple[str, int, str]]:
-    """
-    Prefer the same backend for repeated requests from the same client.
-    If it fails, try the others.
-    """
+
+    # For repeated requests from the same client, use the same backend.
+    # If it fails, try the others.
+
     global NEXT_BACKEND_INDEX
 
     with LOCK:
@@ -80,15 +80,10 @@ def choose_backends_for_client(client_id: str) -> List[Tuple[str, int, str]]:
 
 
 def translate_json_to_http(request_obj: dict) -> Optional[str]:
-    """
-    Translate a simple JSON request into HTTP.
-    Expected input:
-    {
-        "action": "fetch",
-        "resource": "/test",
-        "client_id": "client1"
-    }
-    """
+
+    # Translate a simple JSON request into HTTP.
+    # Expected input: { "action": "fetch", "resource": "/test", "client_id": "client1"}
+
     action = request_obj.get("action")
     resource = request_obj.get("resource")
     client_id = request_obj.get("client_id", "unknown")
