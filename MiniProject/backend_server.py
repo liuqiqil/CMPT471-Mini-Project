@@ -10,7 +10,6 @@ from utils.globals import Resource, HOST, STREAM_RESPONSE_COUNT, STREAM_RESPONSE
 from typing import Dict
 
 BUFFER_SIZE = 4096
-MAX_WAITING = 10
 MAX_CONNECTIONS = 5
 LOGGING_PATH = "logs"
 
@@ -169,6 +168,14 @@ def start_server(port: int, content_type: Resource) -> None:
                 try:
                     client_conn, client_addr = server_socket.accept()
                     log_message(port, f"Accepted connection from port {client_addr[1]}")
+                    
+                    # Send simple server full response if max connections are reached
+                    if len(executor._threads) >= MAX_CONNECTIONS:
+                        log_message(port, "Server Full. Sending 503.")
+                        busy_resp = build_standard_http_response("HTTP/1.1 503 Service Unavailable", "Server Busy")
+                        client_conn.sendall(busy_resp)
+                        client_conn.close()
+                        continue
                     
                     executor.submit(
                         handle_client_connection, 

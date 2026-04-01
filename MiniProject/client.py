@@ -1,7 +1,7 @@
 import socket
 import sys
 from utils.network_config import ClientNetworkConfig
-from utils.cpp import decode_cpp, encode_cpp
+from utils.cpp import decode_cpp, encode_cpp, CPPStatus
 from utils.client_transport_underlay import send_cpp_packet
 from utils.globals import Resource, HOST, STREAM_RESPONSE_COUNT
 
@@ -37,9 +37,23 @@ def main() -> None:
         try:
             response = decode_cpp(client_socket.recvfrom(BUFFER_SIZE)[0])
             if (response['source_id'] != config.proxy_id):
-                print("Received response not from proxy (id = {})! Sender ID:".format(config.proxy_id), response['source_id'])
+                print("Received response not from proxy (id = {})! Dubious Sender ID:".format(config.proxy_id), response['source_id'])
                 return
-            print(response)
+            match(response['status']):
+                case CPPStatus.SUCCESS:
+                    print("Request successful:", response['payload'])
+                case CPPStatus.SERVER_BUSY:
+                    print("Proxy indicates backend server is busy. Status code {}.".format(CPPStatus.SERVER_BUSY.value))
+                    return
+                case CPPStatus.SERVER_UNREACHABLE:
+                    print("Proxy indicates backend server is unreachable. Status code {}.".format(CPPStatus.SERVER_UNREACHABLE.value))
+                    return
+                case CPPStatus.PROXY_BUSY:
+                    print("Proxy is currently busy. Status code {}.".format(CPPStatus.PROXY_BUSY.value))
+                    return
+                case CPPStatus.INVALID_REQUEST:
+                    print("Invalid request sent to proxy. Status code {}.".format(CPPStatus.INVALID_REQUEST.value))
+                    return
         except socket.timeout:
             print("Timed out: No response received within timeout period of {} seconds.".format(TIMEOUT))
             return
