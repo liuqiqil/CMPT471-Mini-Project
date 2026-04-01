@@ -4,17 +4,8 @@ import json
 import time
 from typing import Dict, List, Tuple, Optional
 
-PROXY_HOST = "127.0.0.1"
-PROXY_PORT = 8080
 BUFFER_SIZE = 4096
-SOCKET_TIMEOUT = 3
-
-# backend format:
-# (host, port, server_name)
-BACKEND_SERVERS: List[Tuple[str, int, str]] = [
-    ("127.0.0.1", 8001, "Server1"),
-    ("127.0.0.1", 8002, "Server2"),
-]
+SOCKET_TIMEOUT = 5
 
 # Simple session map
 SESSION_MAP: Dict[str, Tuple[str, int, str]] = {}
