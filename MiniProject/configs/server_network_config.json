@@ -6,23 +6,19 @@
     "servers": [
         {
             "content_type": "PAGE",
-            "port": 9001,
-            "auth_token": "page1:IamServer"
+            "port": 9001
         },
         {
             "content_type": "PAGE",
-            "port": 9002,
-            "auth_token": "page2:IamServer"
+            "port": 9002
         },
         {
             "content_type": "STREAM",
-            "port": 9003,
-            "auth_token": "stream1:IamServer"
+            "port": 9003
         },
         {
             "content_type": "STREAM",
-            "port": 9004,
-            "auth_token": "stream2:IamServer"
+            "port": 9004
         }
     ]
 }

@@ -1,7 +1,6 @@
 import socket
 from utils.network_config import ClientNetworkConfig
-
-HOST = "127.0.0.1"
+from utils.globals import HOST, BUFFER_SIZE
 
 clientNetwork = ClientNetworkConfig()
 client_port_dict = {client_id: None for client_id in clientNetwork.client_ids}

@@ -10,12 +10,18 @@ class CPPStatus(Enum):
     SERVER_UNREACHABLE = 2
     PROXY_BUSY = 3
     INVALID_REQUEST = 4
+    INTERNAL_ERROR = 5
 
 # We use an unassigned protocol number for the ID. Source: https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
 PROTOCOL_ID = 148
 
 # Protocol header format: [1 byte protocol ID][1 byte resource][1 byte source ID][1 byte status code]
 CPP_HEADER_FORMAT = "!BBBB"
+
+class CPPDecodeError(Exception):
+    def __init__(self, message, source_id=None):
+        super().__init__(message)
+        self.source_id = source_id
 
 def encode_cpp(source_id: int, resource: Resource, payload: str = "", status: CPPStatus = CPPStatus.SUCCESS) -> bytes:
     if not (0 <= source_id <= 255):
@@ -25,25 +31,58 @@ def encode_cpp(source_id: int, resource: Resource, payload: str = "", status: CP
     return header + payload.encode()
     
 def decode_cpp(data: bytes) -> dict:
-    if len(data) < struct.calcsize(CPP_HEADER_FORMAT):
-        raise ValueError("Data is too short to contain a valid CPP header")
-    
-    header = data[:struct.calcsize(CPP_HEADER_FORMAT)]
-    payload = data[struct.calcsize(CPP_HEADER_FORMAT):]
-    
-    protocol_id, resource_value, source_id, status_code = struct.unpack(CPP_HEADER_FORMAT, header)
-    
+    header_size = struct.calcsize(CPP_HEADER_FORMAT)
+
+    if len(data) < header_size:
+        raise CPPDecodeError("Data is too short to contain a valid CPP header")
+
+    header = data[:header_size]
+    payload = data[header_size:]
+
+    try:
+        protocol_id, resource_value, source_id, status_code = struct.unpack(CPP_HEADER_FORMAT, header)
+    except struct.error:
+        raise CPPDecodeError("Failed to unpack header")
+
     if protocol_id != PROTOCOL_ID:
-        raise ValueError("Invalid protocol ID")
-    
+        raise CPPDecodeError("Invalid protocol ID", source_id)
+
     try:
         resource = Resource(resource_value)
     except ValueError:
-        raise ValueError("Invalid resource value")
-    
+        raise CPPDecodeError("Invalid resource value", source_id)
+
+    try:
+        status = CPPStatus(status_code)
+    except ValueError:
+        raise CPPDecodeError("Invalid status code", source_id)
+
+    try:
+        decoded_payload = payload.decode()
+    except Exception:
+        raise CPPDecodeError("Payload decoding failed", source_id)
+
     return {
         "source_id": source_id,
         "resource": resource,
-        "payload": payload.decode(),
-        "status": CPPStatus(status_code)
+        "payload": decoded_payload,
+        "status": status
     }
+    
+def get_cpp_sender_id(data: bytes) -> int:
+    header_size = struct.calcsize(CPP_HEADER_FORMAT)
+
+    if len(data) < header_size:
+        raise CPPDecodeError("Data is too short to contain a valid CPP header")
+
+    header = data[:header_size]
+
+    try:
+        protocol_id, resource_value, source_id, status_code = struct.unpack(CPP_HEADER_FORMAT, header)
+    except struct.error:
+        raise CPPDecodeError("Failed to unpack header")
+
+    if protocol_id != PROTOCOL_ID:
+        raise CPPDecodeError("Invalid protocol ID", source_id)
+
+    return source_id

@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from enum import Enum
 import logging
 import os
 import socket
@@ -6,17 +7,15 @@ import threading
 import sys
 import time
 from utils.network_config import ServerNetworkConfig
-from utils.globals import Resource, HOST, STREAM_RESPONSE_COUNT, STREAM_RESPONSE_INTERVAL, base64_encode
+from utils.globals import Resource, HOST, STREAM_RESPONSE_COUNT, STREAM_RESPONSE_INTERVAL, BUFFER_SIZE, LOGGING_DIR, base64_encode
 from typing import Dict
 
-BUFFER_SIZE = 4096
 MAX_CONNECTIONS = 5
-LOGGING_PATH = "logs"
 
-PATH_DB: Dict[str, Resource] = {
-    "/ping": Resource.PING,
-    "/page": Resource.PAGE,
-    "/stream": Resource.STREAM
+PATH_DB = {
+    Resource.PING: "/ping",
+    Resource.PAGE: "/page",
+    Resource.STREAM: "/stream"
 }
 
 RESPONSE_DB: Dict[Resource, str] = {
@@ -32,7 +31,7 @@ loggers = {}
 def log_message(server_port: int, message: str) -> None:
     if server_port not in loggers:
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        log_dir = os.path.join(base_dir, LOGGING_PATH)
+        log_dir = os.path.join(base_dir, LOGGING_DIR)
         os.makedirs(log_dir, exist_ok=True)
         log_file_path = os.path.join(log_dir, f"server_{server_port}.log")
 
@@ -132,7 +131,7 @@ def handle_client_connection(client_connection: socket.socket, server_port: int,
             log_message(server_port, f"403 Forbidden: Invalid Token - Received: {auth_header}, Expected: {EXPECTED_TOKEN}")
             return
 
-        if path in PATH_DB and PATH_DB[path] == content_type:
+        if path == PATH_DB[Resource.PING] or (content_type in PATH_DB and PATH_DB[content_type] == path):
             body = RESPONSE_DB[content_type]
             if content_type == Resource.STREAM:
                 for i in range(STREAM_RESPONSE_COUNT):
@@ -195,7 +194,7 @@ def main() -> None:
     for content_type, port in config.server_ports:
         t =threading.Thread(
             target=start_server,
-            args=(port, Resource[content_type]),
+            args=(port, content_type),
             daemon=True
         )
         t.start()

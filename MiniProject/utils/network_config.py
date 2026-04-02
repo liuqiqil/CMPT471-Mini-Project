@@ -1,5 +1,6 @@
 import json
 import os
+from utils.globals import Resource
 
 class ConfigBase:
     def __init__(self, filename):
@@ -15,12 +16,6 @@ class ServerNetworkConfig(ConfigBase):
     @property
     def proxy_auth_token(self):
         return self._data["proxy"]["auth_token"]
-    
-    def server_auth_token(self, port):
-        for srv in self._data["servers"]:
-            if srv["port"] == port:
-                return srv["auth_token"]
-        return None
 
     @property
     def proxy_port(self):
@@ -29,15 +24,15 @@ class ServerNetworkConfig(ConfigBase):
     @property
     def server_ports(self):
         return [
-                (srv["content_type"], srv["port"]) 
-                for srv in self._data["servers"]
-                ]
+            (Resource[srv["content_type"]], srv["port"]) 
+            for srv in self._data["servers"]
+        ]
 
-    def get_server_ports(self, content_type):
+    def get_server_ports(self, content_type: Resource):
         return [
             srv["port"] for srv in self._data["servers"] 
-            if srv["content_type"] == content_type
-                ]
+            if Resource[srv["content_type"]] == content_type
+        ]
 
 class ClientNetworkConfig(ConfigBase):
     def __init__(self):
