@@ -1,248 +1,225 @@
 import socket
 import threading
-import json
 import time
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Tuple, Optional
+
+from utils.cpp import decode_cpp, encode_cpp
+from utils.globals import Resource, HOST
+from utils.network_config import ClientNetworkConfig, ServerNetworkConfig
+from utils.client_transport_underlay import send_cpp_packet, update_client_port
 
 BUFFER_SIZE = 4096
 SOCKET_TIMEOUT = 5
 
-# Simple session map
-SESSION_MAP: Dict[str, Tuple[str, int, str]] = {}
+client_config = ClientNetworkConfig()
+server_config = ServerNetworkConfig()
 
-# Round-robin pointer for new clients
-NEXT_BACKEND_INDEX = 0
+# client_id -> (ip, port)
+CLIENT_ADDRESS_MAP: Dict[int, Tuple[str, int]] = {}
 
-# Basic stats
 STATS = {
     "total_requests": 0,
     "successful_requests": 0,
     "failed_requests": 0,
-    "failover_count": 0,
 }
 
 LOCK = threading.Lock()
 
+RESOURCE_TO_PATH = {
+    Resource.PING: "/ping",
+    Resource.PAGE: "/page",
+    Resource.STREAM: "/stream",
+}
+
 
 def log_message(message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{timestamp}] {message}"
-    print(line)
-    with open("proxy_log.txt", "a", encoding="utf-8") as log_file:
-        log_file.write(line + "\n")
+    print(f"[{timestamp}] {message}")
 
 
-def make_json_response(
-    status: int,
-    body: str = "",
-    error: str = "",
-    server: str = "",
-    latency_ms: Optional[float] = None
-) -> bytes:
-    response = {
-        "status": status,
-        "server": server,
-        "body": body,
-    }
-    if error:
-        response["error"] = error
-    if latency_ms is not None:
-        response["latency_ms"] = round(latency_ms, 2)
-    return json.dumps(response).encode()
-
-
-def choose_backends_for_client(client_id: str) -> List[Tuple[str, int, str]]:
-
-    # For repeated requests from the same client, use the same backend.
-    # If it fails, try the others.
-
-    global NEXT_BACKEND_INDEX
-
-    with LOCK:
-        if client_id in SESSION_MAP:
-            preferred = SESSION_MAP[client_id]
-            others = [srv for srv in BACKEND_SERVERS if srv != preferred]
-            return [preferred] + others
-
-        chosen = BACKEND_SERVERS[NEXT_BACKEND_INDEX]
-        NEXT_BACKEND_INDEX = (NEXT_BACKEND_INDEX + 1) % len(BACKEND_SERVERS)
-        others = [srv for srv in BACKEND_SERVERS if srv != chosen]
-        return [chosen] + others
-
-
-def translate_json_to_http(request_obj: dict) -> Optional[str]:
-
-    # Translate a simple JSON request into HTTP.
-    # Expected input: { "action": "fetch", "resource": "/test", "client_id": "client1"}
-
-    action = request_obj.get("action")
-    resource = request_obj.get("resource")
-    client_id = request_obj.get("client_id", "unknown")
-
-    if action != "fetch" or not resource:
-        return None
-
-    http_request = (
-        f"GET {resource} HTTP/1.0\r\n"
-        f"Host: 127.0.0.1\r\n"
-        f"X-Client-ID: {client_id}\r\n"
-        f"X-Proxy-Bridge: basic-interoperation\r\n"
+def build_http_request(resource: Resource) -> str:
+    path = RESOURCE_TO_PATH[resource]
+    auth_value = f"Basic {__import__('utils.globals').globals.base64_encode(server_config.proxy_auth_token)}"
+    return (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {HOST}\r\n"
+        f"Authorization: {auth_value}\r\n"
+        f"Connection: close\r\n"
         f"\r\n"
     )
-    return http_request
 
 
-def parse_http_response(http_response: str) -> Tuple[int, str]:
+def choose_backend_port(resource: Resource) -> Optional[int]:
+    ports = server_config.get_server_ports(resource.name)
+    if not ports:
+        return None
+    return ports[0]
+
+
+def parse_standard_http_response(http_response: str) -> Tuple[int, str]:
     status_code = 500
     body = ""
 
-    lines = http_response.split("\r\n")
-    if lines:
-        parts = lines[0].split()
-        if len(parts) >= 2 and parts[1].isdigit():
-            status_code = int(parts[1])
+    parts = http_response.split("\r\n\r\n", 1)
+    header_text = parts[0]
+    body = parts[1] if len(parts) > 1 else ""
 
-    separator = "\r\n\r\n"
-    if separator in http_response:
-        body = http_response.split(separator, 1)[1]
+    status_line = header_text.split("\r\n")[0]
+    status_parts = status_line.split()
+    if len(status_parts) >= 2 and status_parts[1].isdigit():
+        status_code = int(status_parts[1])
 
     return status_code, body
 
 
-def forward_to_backend(http_request: str, backend: Tuple[str, int, str]) -> Tuple[int, str]:
-    host, port, _ = backend
+def parse_chunked_http_response(http_response: str) -> Tuple[int, list[str]]:
+    status_code = 500
+    chunks = []
+
+    parts = http_response.split("\r\n\r\n", 1)
+    header_text = parts[0]
+    body = parts[1] if len(parts) > 1 else ""
+
+    status_line = header_text.split("\r\n")[0]
+    status_parts = status_line.split()
+    if len(status_parts) >= 2 and status_parts[1].isdigit():
+        status_code = int(status_parts[1])
+
+    lines = body.split("\r\n")
+    i = 0
+    while i < len(lines):
+        size_line = lines[i].strip()
+        if not size_line:
+            i += 1
+            continue
+        try:
+            chunk_size = int(size_line, 16)
+        except ValueError:
+            break
+        if chunk_size == 0:
+            break
+        i += 1
+        if i < len(lines):
+            chunks.append(lines[i])
+        i += 1
+
+    return status_code, chunks
+
+
+def forward_to_backend(resource: Resource) -> Tuple[int, list[str]]:
+    backend_port = choose_backend_port(resource)
+    if backend_port is None:
+        raise RuntimeError(f"No backend configured for resource {resource.name}")
+
+    http_request = build_http_request(resource)
+
     backend_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     backend_socket.settimeout(SOCKET_TIMEOUT)
 
     try:
-        backend_socket.connect((host, port))
+        backend_socket.connect((HOST, backend_port))
         backend_socket.sendall(http_request.encode())
 
-        response_data = ""
+        response_data = b""
         while True:
             chunk = backend_socket.recv(BUFFER_SIZE)
             if not chunk:
                 break
-            response_data += chunk.decode()
+            response_data += chunk
 
-        return parse_http_response(response_data)
+        decoded = response_data.decode(errors="replace")
+
+        if "Transfer-Encoding: chunked" in decoded:
+            status_code, chunks = parse_chunked_http_response(decoded)
+            return status_code, chunks
+
+        status_code, body = parse_standard_http_response(decoded)
+        return status_code, [body]
+
     finally:
         backend_socket.close()
 
 
-def handle_client(client_connection: socket.socket, client_address: Tuple[str, int]) -> None:
-    start_time = time.time()
+def send_error_response(proxy_socket: socket.socket, client_id: int, error_msg: str) -> None:
+    message = encode_cpp(
+        source_id=client_config.proxy_id,
+        resource=Resource.PAGE,
+        payload=f"ERROR: {error_msg}"
+    )
+    send_cpp_packet(dest_id=client_id, message=message, socket=proxy_socket)
+
+
+def handle_cpp_request(data: bytes, addr: Tuple[str, int], proxy_socket: socket.socket) -> None:
+    try:
+        packet = decode_cpp(data)
+    except Exception as exc:
+        log_message(f"Dropped malformed CPP packet from {addr}: {exc}")
+        return
+
+    client_id = packet["source_id"]
+    resource = packet["resource"]
+
+    if not client_config.is_authorized(client_id):
+        log_message(f"Dropped packet from unauthorized client ID {client_id}")
+        return
+
+    with LOCK:
+        STATS["total_requests"] += 1
+        CLIENT_ADDRESS_MAP[client_id] = addr
+
+    update_client_port(client_id, addr[1])
+    log_message(f"Received {resource.name} request from client {client_id} at {addr}")
 
     try:
-        raw_data = client_connection.recv(BUFFER_SIZE).decode()
-        if not raw_data:
-            return
+        status_code, payload_parts = forward_to_backend(resource)
 
-        log_message(f"Received from {client_address}: {raw_data}")
-
-        with LOCK:
-            STATS["total_requests"] += 1
-
-        try:
-            request_obj = json.loads(raw_data)
-        except json.JSONDecodeError:
+        if status_code != 200:
             with LOCK:
                 STATS["failed_requests"] += 1
-            client_connection.sendall(
-                make_json_response(400, error="Invalid JSON request")
-            )
+            send_error_response(proxy_socket, client_id, f"Backend returned HTTP {status_code}")
             return
 
-        client_id = request_obj.get("client_id", "unknown")
-        http_request = translate_json_to_http(request_obj)
-
-        if http_request is None:
-            with LOCK:
-                STATS["failed_requests"] += 1
-            client_connection.sendall(
-                make_json_response(400, error="Unsupported request format")
+        for part in payload_parts:
+            response_packet = encode_cpp(
+                source_id=client_config.proxy_id,
+                resource=resource,
+                payload=part
             )
-            return
-
-        candidate_backends = choose_backends_for_client(client_id)
-        last_error = None
-
-        for index, backend in enumerate(candidate_backends):
-            host, port, server_name = backend
-            try:
-                status_code, body = forward_to_backend(http_request, backend)
-
-                with LOCK:
-                    SESSION_MAP[client_id] = backend
-                    STATS["successful_requests"] += 1
-                    if index > 0:
-                        STATS["failover_count"] += 1
-
-                latency_ms = (time.time() - start_time) * 1000
-                log_message(
-                    f"Client {client_id} -> {server_name} ({host}:{port}), "
-                    f"status={status_code}, latency={latency_ms:.2f} ms"
-                )
-
-                client_connection.sendall(
-                    make_json_response(
-                        status=status_code,
-                        body=body,
-                        server=server_name,
-                        latency_ms=latency_ms,
-                    )
-                )
-                return
-
-            except Exception as exc:
-                last_error = str(exc)
-                log_message(f"Backend {server_name} failed: {exc}")
+            send_cpp_packet(dest_id=client_id, message=response_packet, socket=proxy_socket)
 
         with LOCK:
-            STATS["failed_requests"] += 1
+            STATS["successful_requests"] += 1
 
-        client_connection.sendall(
-            make_json_response(503, error=f"No backend available: {last_error}")
-        )
+        log_message(f"Completed request for client {client_id} ({resource.name})")
 
     except Exception as exc:
-        log_message(f"Proxy error: {exc}")
         with LOCK:
             STATS["failed_requests"] += 1
-        try:
-            client_connection.sendall(
-                make_json_response(500, error="Internal proxy error")
-            )
-        except Exception:
-            pass
-    finally:
-        client_connection.close()
+        log_message(f"Error handling client {client_id}: {exc}")
+        send_error_response(proxy_socket, client_id, str(exc))
 
 
 def main() -> None:
-    open("proxy_log.txt", "w", encoding="utf-8").close()
+    proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    proxy_socket.bind((HOST, client_config.proxy_port))
 
-    proxy_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    proxy_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    proxy_server.bind((PROXY_HOST, PROXY_PORT))
-    proxy_server.listen(5)
-
-    log_message(f"Proxy listening on {PROXY_HOST}:{PROXY_PORT}")
+    log_message(f"CPP proxy listening on UDP {HOST}:{client_config.proxy_port}")
 
     try:
         while True:
-            client_connection, client_address = proxy_server.accept()
+            data, addr = proxy_socket.recvfrom(BUFFER_SIZE)
             thread = threading.Thread(
-                target=handle_client,
-                args=(client_connection, client_address),
+                target=handle_cpp_request,
+                args=(data, addr, proxy_socket),
                 daemon=True
             )
             thread.start()
+
     except KeyboardInterrupt:
         log_message("Proxy shutting down.")
         log_message(f"Final stats: {STATS}")
     finally:
-        proxy_server.close()
+        proxy_socket.close()
 
 
 if __name__ == "__main__":

@@ -2,11 +2,11 @@ import socket
 import sys
 from utils.network_config import ClientNetworkConfig
 from utils.cpp import decode_cpp, encode_cpp
-from utils.client_transport_underlay import send_cpp_packet
+from utils.client_transport_underlay import send_cpp_packet, update_client_port
 from utils.globals import Resource, HOST, STREAM_RESPONSE_COUNT
 
 BUFFER_SIZE = 4096
-TIMEOUT = 5
+TIMEOUT = 15
 
 def main() -> None:
     if len(sys.argv) != 4:
@@ -25,6 +25,7 @@ def main() -> None:
     
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     client_socket.bind((HOST, port))
+    update_client_port(client_id, port)
     cpp_message = encode_cpp(source_id=client_id, resource=resource)
     send_cpp_packet(dest_id=config.proxy_id, message=cpp_message, socket=client_socket)
     

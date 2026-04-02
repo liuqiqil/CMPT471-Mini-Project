@@ -23,6 +23,11 @@
             "content_type": "STREAM",
             "port": 9004,
             "auth_token": "stream2:IamServer"
+        },
+        {
+          "content_type": "PING",
+          "port": 9005,
+          "auth_token": "ping1:IamServer"
         }
     ]
 }
