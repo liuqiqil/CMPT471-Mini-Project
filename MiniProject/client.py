@@ -26,21 +26,39 @@ def main() -> None:
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     client_socket.bind((HOST, port))
     update_client_port(client_id, port)
+    import time
+
+    start = time.time()
     cpp_message = encode_cpp(source_id=client_id, resource=resource)
     send_cpp_packet(dest_id=config.proxy_id, message=cpp_message, socket=client_socket)
-    
-    # For STREAM resource, we expect 10 (defined in globals.py) responses spaced 1s apart. Only 1 response for the rest.
+
+    # For STREAM resource, we expect 10 responses spaced 1s apart.
     response_count = STREAM_RESPONSE_COUNT if resource == Resource.STREAM else 1
 
-    for _ in range(response_count):
+    prev_time = None
+
+    for i in range(response_count):
         client_socket.settimeout(TIMEOUT)
-        
+
         try:
             response = decode_cpp(client_socket.recvfrom(BUFFER_SIZE)[0])
-            if (response['source_id'] != config.proxy_id):
-                print("Received response not from proxy (id = {})! Sender ID:".format(config.proxy_id), response['source_id'])
+            now = time.time()
+
+            if i == 0:
+                print(f"Latency: {(now - start) * 1000:.2f} ms")
+            elif resource == Resource.STREAM:
+                print(f"Interval: {(now - prev_time):.2f} s")
+
+            if response['source_id'] != config.proxy_id:
+                print(
+                    "Received response not from proxy (id = {})! Sender ID:".format(config.proxy_id),
+                    response['source_id']
+                )
                 return
+
             print(response)
+            prev_time = now
+
         except socket.timeout:
             print("Timed out: No response received within timeout period of {} seconds.".format(TIMEOUT))
             return
