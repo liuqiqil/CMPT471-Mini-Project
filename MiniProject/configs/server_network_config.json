@@ -1,24 +1,36 @@
 {
-    "proxy": {
-        "port": 8000,
-        "auth_token": "proxy:IamProxy"
+  "proxy": {
+    "port": 8000,
+    "auth_token": "proxy:IamProxy"
+  },
+  "b_gateway": {
+    "host": "127.0.0.1",
+    "port": 8500
+  },
+  "servers": [
+    {
+      "content_type": "PAGE",
+      "service_id": "content.page",
+      "host": "127.0.0.1",
+      "port": 9001
     },
-    "servers": [
-        {
-            "content_type": "PAGE",
-            "port": 9001
-        },
-        {
-            "content_type": "PAGE",
-            "port": 9002
-        },
-        {
-            "content_type": "STREAM",
-            "port": 9003
-        },
-        {
-            "content_type": "STREAM",
-            "port": 9004
-        }
-    ]
+    {
+      "content_type": "PAGE",
+      "service_id": "content.page",
+      "host": "127.0.0.1",
+      "port": 9002
+    },
+    {
+      "content_type": "STREAM",
+      "service_id": "content.stream",
+      "host": "127.0.0.1",
+      "port": 9003
+    },
+    {
+      "content_type": "STREAM",
+      "service_id": "content.stream",
+      "host": "127.0.0.1",
+      "port": 9004
+    }
+  ]
 }

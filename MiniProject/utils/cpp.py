@@ -1,36 +1,63 @@
 import struct
 from enum import Enum
+
 from utils.globals import Resource
+
 
 # Used only by the proxy to communicate the status of the request back to the client
 # SERVER_BUSY and SERVER_UNREACHABLE are only returned by non-ping requests!
 class CPPStatus(Enum):
     SUCCESS_DONE = 0
-    SUCCESS_PARTIAL = 1 # Indicates that the stream is not done!
+    SUCCESS_PARTIAL = 1  # Indicates that the stream is not done!
     SERVER_BUSY = 2
     SERVER_UNREACHABLE = 3
     PROXY_BUSY = 4
     INVALID_REQUEST = 5
     INTERNAL_ERROR = 6
 
-# We use an unassigned protocol number for the ID. Source: https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
+
+# We use an unassigned protocol number for the ID.
 PROTOCOL_ID = 148
 
-# Protocol header format: [1 byte protocol ID][1 byte resource][1 byte source ID][1 byte status code]
-CPP_HEADER_FORMAT = "!BBBB"
+# Protocol header format:
+# [1 byte protocol ID]
+# [1 byte resource]
+# [1 byte source ID]
+# [1 byte status code]
+# [4 bytes request_id]
+CPP_HEADER_FORMAT = "!BBBBI"
+
 
 class CPPDecodeError(Exception):
     def __init__(self, message, source_id=None):
         super().__init__(message)
         self.source_id = source_id
 
-def encode_cpp(source_id: int, resource: Resource, payload: str = "", status: CPPStatus = CPPStatus.SUCCESS_DONE) -> bytes:
+
+def encode_cpp(
+    source_id: int,
+    resource: Resource,
+    payload: str = "",
+    status: CPPStatus = CPPStatus.SUCCESS_DONE,
+    request_id: int = 0,
+) -> bytes:
     if not (0 <= source_id <= 255):
         raise ValueError("Source ID must be between 0 and 255")
-    
-    header = struct.pack(CPP_HEADER_FORMAT, PROTOCOL_ID, resource.value, source_id, status.value)
+
+    if not (0 <= request_id <= 0xFFFFFFFF):
+        raise ValueError("Request ID must be between 0 and 2^32 - 1")
+
+    header = struct.pack(
+        CPP_HEADER_FORMAT,
+        PROTOCOL_ID,
+        resource.value,
+        source_id,
+        status.value,
+        request_id,
+    )
     return header + payload.encode()
-    
+
+
 def decode_cpp(data: bytes) -> dict:
     header_size = struct.calcsize(CPP_HEADER_FORMAT)
 
@@ -41,7 +68,10 @@ def decode_cpp(data: bytes) -> dict:
     payload = data[header_size:]
 
     try:
-        protocol_id, resource_value, source_id, status_code = struct.unpack(CPP_HEADER_FORMAT, header)
+        protocol_id, resource_value, source_id, status_code, request_id = struct.unpack(
+            CPP_HEADER_FORMAT,
+            header,
+        )
     except struct.error:
         raise CPPDecodeError("Failed to unpack header")
 
@@ -67,9 +97,11 @@ def decode_cpp(data: bytes) -> dict:
         "source_id": source_id,
         "resource": resource,
         "payload": decoded_payload,
-        "status": status
+        "status": status,
+        "request_id": request_id,
     }
-    
+
+
 def get_cpp_sender_id(data: bytes) -> int:
     header_size = struct.calcsize(CPP_HEADER_FORMAT)
 
@@ -79,7 +111,7 @@ def get_cpp_sender_id(data: bytes) -> int:
     header = data[:header_size]
 
     try:
-        protocol_id, resource_value, source_id, status_code = struct.unpack(CPP_HEADER_FORMAT, header)
+        protocol_id, _, source_id, _, _ = struct.unpack(CPP_HEADER_FORMAT, header)
     except struct.error:
         raise CPPDecodeError("Failed to unpack header")
 

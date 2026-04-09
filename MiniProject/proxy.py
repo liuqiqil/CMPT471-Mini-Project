@@ -1,90 +1,52 @@
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import socket
+import sys
 import threading
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Optional
+
+from utils.client_transport_underlay import (
+    cleanup_underlay,
+    proxy_receive_cpp_packet,
+    send_cpp_packet,
+    setup_underlay,
+)
+from utils.cpp import CPPDecodeError, CPPStatus, decode_cpp, encode_cpp
+from utils.globals import BUFFER_SIZE, Resource, TIMEOUT, base64_encode
 from utils.network_config import ClientNetworkConfig, ServerNetworkConfig
-from utils.globals import HOST, BUFFER_SIZE, TIMEOUT, Resource, base64_encode
-from backend_server import PATH_DB
-from utils.cpp import CPPStatus, encode_cpp, decode_cpp, CPPDecodeError
-from utils.client_transport_underlay import cleanup_underlay, proxy_receive_cpp_packet, send_cpp_packet, setup_underlay
 
-# Simple session map
-SESSION_MAP: Dict[int, Dict[Resource, int]] = {}
+MAX_PROXY_WORKERS = 20
+WORKER_SEMAPHORE = threading.BoundedSemaphore(MAX_PROXY_WORKERS)
 
-# Round-robin pointer for backend selection
-NEXT_INDEX_MAP: Dict[Resource, int] = {res: 0 for res in Resource}
+LOCK = threading.Lock()
 
-# Basic stats
 STATS = {
     "total_requests": 0,
     "successful_requests": 0,
     "failed_requests": 0,
-    "failover_count": 0,
+    "proxy_busy": 0,
+    "internal_errors": 0,
 }
 
-LOCK = threading.Lock()
+# Compound session table
+COMPOUND_SESSION_MAP: Dict[tuple[int, int], dict] = {}
+B_SESSION_BY_CLIENT_RESOURCE: Dict[tuple[int, Resource], str] = {}
 
 server_config = ServerNetworkConfig()
 client_config = ClientNetworkConfig()
+CURRENT_PROXY_ID: Optional[int] = None
 
 
 def log_message(message: str) -> None:
-    timestamp = datetime.now().strftime('%a %b %d %H:%M:%S %Y')
+    timestamp = datetime.now().strftime("%a %b %d %H:%M:%S %Y")
     thread_id = threading.get_ident()
     print(f"[{timestamp}] [Thread:{thread_id}] {message}")
 
-def choose_backends_for_client(client_id: int, resource: Resource) -> List[int]:
-    global SESSION_MAP, NEXT_INDEX_MAP
 
-    available_servers = []
-    if resource != Resource.PING:
-        available_servers = server_config.get_server_ports(resource)
-    else:
-        # For PING, return all servers
-        return server_config.server_ports()
-    
-    if not available_servers:
-        return []
-
-    with LOCK:
-        if client_id in SESSION_MAP and resource in SESSION_MAP[client_id]:
-            preferred_port = SESSION_MAP[client_id][resource]
-            # For existing sessions, use the same backend and add other servers as backup
-            if preferred_port in available_servers:
-                others = [p for p in available_servers if p != preferred_port]
-                return [preferred_port] + others
-
-        # Choose backend using round-robin for new sessions otherwise
-        current_idx = NEXT_INDEX_MAP.get(resource, 0)
-        chosen_port = available_servers[current_idx % len(available_servers)]
-        NEXT_INDEX_MAP[resource] = (current_idx + 1) % len(available_servers)
-
-        # Save Client to Session Map
-        if client_id not in SESSION_MAP:
-            SESSION_MAP[client_id] = {}
-        SESSION_MAP[client_id][resource] = chosen_port
-        others = [p for p in available_servers if p != chosen_port]
-        return [chosen_port] + others
-
-
-def write_http_request(resource: Resource) -> Optional[bytes]:
-    resource_path = PATH_DB.get(resource)
-    if resource_path is None:
-        raise ValueError("Unsupported resource type")
-
-    http_request = (
-        f"GET {resource_path} HTTP/1.1\r\n"
-        f"Host: 127.0.0.1\r\n"
-        f"Authorization: Basic {base64_encode(server_config.proxy_auth_token)}\r\n"
-        f"\r\n"
-    )
-    return http_request.encode()
-
-def parse_http_response(http_response: bytes) -> Tuple[int, bytes, bool]:
+def parse_http_response(http_response: bytes):
     status_code = 500
     body = b""
     is_chunked = False
+    headers = {}
 
     separator = b"\r\n\r\n"
     if separator in http_response:
@@ -101,23 +63,29 @@ def parse_http_response(http_response: bytes) -> Tuple[int, bytes, bool]:
         for line in lines[1:]:
             if b":" in line:
                 key, value = line.split(b":", 1)
-                if key.strip().lower() == b"transfer-encoding" and b"chunked" in value.lower():
+                decoded_key = key.strip().decode().lower()
+                decoded_value = value.strip().decode()
+                headers[decoded_key] = decoded_value
+                if decoded_key == "transfer-encoding" and "chunked" in decoded_value.lower():
                     is_chunked = True
-                    break
 
-    return status_code, body, is_chunked
+    return status_code, body, is_chunked, headers
 
-def read_http_chunk(sock: socket.socket) -> Tuple[bytes, bool]:
+
+def read_http_chunk(sock: socket.socket):
     def read_until(delimiter: bytes) -> bytes:
         data = b""
         while not data.endswith(delimiter):
             char = sock.recv(1)
-            if not char: break
+            if not char:
+                break
             data += char
         return data
+
     size_line = read_until(b"\r\n").strip()
     if not size_line:
         return b"", True
+
     try:
         chunk_size = int(size_line, 16)
     except ValueError:
@@ -126,199 +94,345 @@ def read_http_chunk(sock: socket.socket) -> Tuple[bytes, bool]:
     if chunk_size == 0:
         read_until(b"\r\n")
         return b"", True
+
     chunk_data = b""
     while len(chunk_data) < chunk_size:
-        to_read = chunk_size - len(chunk_data)
-        chunk_data += sock.recv(to_read)
-    read_until(b"\r\n")
+        chunk_data += sock.recv(chunk_size - len(chunk_data))
 
+    read_until(b"\r\n")
     return chunk_data, False
 
-def forward_to_backend(client_id: int, resource: Resource):
-    global SESSION_MAP
 
-    payload = write_http_request(resource)
+def try_parse_one_chunk_from_buffer(buffer: bytes) -> tuple[bytes | None, bytes, bool]:
+    sep = b"\r\n"
+    idx = buffer.find(sep)
+    if idx == -1:
+        return None, buffer, False
+
+    size_line = buffer[:idx]
+    try:
+        chunk_size = int(size_line.decode(), 16)
+    except ValueError:
+        return None, buffer, False
+
+    needed = idx + 2 + chunk_size + 2
+    if len(buffer) < needed:
+        return None, buffer, False
+
+    chunk_start = idx + 2
+    chunk_end = chunk_start + chunk_size
+    chunk_data = buffer[chunk_start:chunk_end]
+    trailer = buffer[chunk_end:chunk_end + 2]
+    if trailer != b"\r\n":
+        return None, buffer, False
+
+    remaining = buffer[needed:]
+
+    if chunk_size == 0:
+        return b"", remaining, True
+
+    return chunk_data, remaining, False
+
+
+def return_to_client(
+    status_code: int,
+    body: bytes,
+    client_id: int,
+    resource: Resource,
+    request_id: int,
+) -> None:
+    if CURRENT_PROXY_ID is None:
+        raise RuntimeError("Current proxy ID is not initialized")
+
+    response = encode_cpp(
+        source_id=CURRENT_PROXY_ID,
+        resource=resource,
+        payload=body.decode(errors="replace"),
+        status=CPPStatus(status_code),
+        request_id=request_id,
+    )
+    send_cpp_packet(client_id, response)
+
+
+def stream_chunks_to_client(
+    source_sock: socket.socket,
+    client_id: int,
+    resource: Resource,
+    request_id: int,
+    initial_body: bytes,
+) -> None:
+    buffer = initial_body
+    done = False
+
+    while not done:
+        chunk_data, buffer, done = try_parse_one_chunk_from_buffer(buffer)
+
+        if chunk_data is None:
+            more = source_sock.recv(BUFFER_SIZE)
+            if not more:
+                break
+            buffer += more
+            continue
+
+        if done:
+            return_to_client(
+                CPPStatus.SUCCESS_DONE.value,
+                b"",
+                client_id,
+                resource,
+                request_id,
+            )
+            break
+
+        if chunk_data:
+            return_to_client(
+                CPPStatus.SUCCESS_PARTIAL.value,
+                chunk_data,
+                client_id,
+                resource,
+                request_id,
+            )
+
+
+def map_resource_to_service(resource: Resource) -> str:
+    if resource == Resource.PAGE:
+        return server_config.get_service_id(Resource.PAGE)
+    if resource == Resource.STREAM:
+        return server_config.get_service_id(Resource.STREAM)
+    if resource == Resource.PING:
+        return "b.network.status"
+    raise ValueError(f"Unsupported resource: {resource}")
+
+
+def build_gateway_request(
+    path: str,
+    headers: Dict[str, str] | None = None,
+) -> bytes:
+    gateway_host, gateway_port = server_config.b_gateway_endpoint
+
+    header_lines = [
+        f"GET {path} HTTP/1.1",
+        f"Host: {gateway_host}:{gateway_port}",
+        f"Authorization: Basic {base64_encode(server_config.proxy_auth_token)}",
+    ]
+
+    if headers:
+        for key, value in headers.items():
+            header_lines.append(f"{key}: {value}")
+
+    request = "\r\n".join(header_lines) + "\r\n\r\n"
+    return request.encode()
+
+
+def forward_to_b_network(client_id: int, resource: Resource, request_id: int) -> None:
+    gateway_host, gateway_port = server_config.b_gateway_endpoint
 
     if resource == Resource.PING:
-
-        total_available = 0
-        total_busy = 0
-        total_unreachable = 0
-        total_servers = 0
-
-        lines = []
-
-        def ping_server(port):
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.settimeout(TIMEOUT)
-                    sock.connect((HOST, port))
-                    sock.sendall(payload)
-                    initial_data = sock.recv(BUFFER_SIZE)
-                    status_code, _, _ = parse_http_response(initial_data)
-                    log_message(f"Pinged server on port {port} with resource {resource.name}: Status code {status_code}")
-                    return port, status_code
-            except (ConnectionRefusedError, socket.timeout, Exception):
-                log_message(f"Server {port} unreachable during PING.")
-                return port, "unreachable"
-
-        resource_ports = {}
-        all_ports = []
-
-        for res in Resource:
-            ports = server_config.get_server_ports(res)
-            if not ports:
-                continue
-            resource_ports[res] = ports
-            all_ports.extend((res, port) for port in ports)
-
-        with ThreadPoolExecutor(max_workers=len(all_ports)) as executor:
-            results = list(executor.map(lambda rp: (rp[0], *ping_server(rp[1])), all_ports))
-
-        # Group results by resource
-        results_by_resource = {res: [] for res in resource_ports}
-
-        for res, port, status in results:
-            results_by_resource[res].append((port, status))
-
-        # Process each resource
-        for res, ports in resource_ports.items():
-            available, busy, unreachable = [], [], []
-
-            for port, status in results_by_resource[res]:
-                if status == 200:
-                    available.append(port)
-                elif status == 503:
-                    busy.append(port)
-                else:
-                    unreachable.append(port)
-
-            total = len(ports)
-            a, b, u = len(available), len(busy), len(unreachable)
-
-            total_available += a
-            total_busy += b
-            total_unreachable += u
-            total_servers += total
-
-            def pct(x, t):
-                return int(x / t * 100) if t > 0 else 0
-
-            line = (
-                f"{res}: {pct(a, total)}% ({a}/{total}) available, "
-                f"{pct(b, total)}% ({b}/{total}) busy, "
-                f"{pct(u, total)}% ({u}/{total}) unreachable. "
-                f"Total online: {pct(a, total)}% ({a}/{total})"
-            )
-            lines.append(line)
-
-        # Total line
-        def pct(x, t):
-            return int(x / t * 100) if t > 0 else 0
-
-        total_line = (
-            f"Total: "
-            f"{pct(total_available, total_servers)}% ({total_available}/{total_servers}) available, "
-            f"{pct(total_busy, total_servers)}% ({total_busy}/{total_servers}) busy, "
-            f"{pct(total_unreachable, total_servers)}% ({total_unreachable}/{total_servers}) unreachable. "
-            f"Total online: {pct(total_available, total_servers)}% ({total_available}/{total_servers})"
-        )
-
-        final_body = "\n".join(lines + [total_line])
-        return_to_client(CPPStatus.SUCCESS_DONE.value, final_body.encode(), client_id)
-        with LOCK:
-            STATS["successful_requests"] += 1
-        return
-
-    # Non-PING resources
-    backend_ports = choose_backends_for_client(client_id, resource)
-
-    if not backend_ports:
-        with LOCK:
-            STATS["failed_requests"] += 1
-        raise RuntimeError(f"No backend servers available for resource: {resource}")
-
-    any_busy = False
-    any_unreachable = False
-
-    for index, port in enumerate(backend_ports):
+        sock = None
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.connect((HOST, port))
             sock.settimeout(TIMEOUT)
-            sock.sendall(payload)
-
-            log_message(f"Sent request for resource {resource.name} from client {client_id} to backend server on port {port}")
+            sock.connect((gateway_host, gateway_port))
+            sock.sendall(build_gateway_request("/status"))
             initial_data = sock.recv(BUFFER_SIZE)
-            status_code, body, is_chunked = parse_http_response(initial_data)
-            log_message(f"Received response with status code {status_code} from backend server on port {port} for client {client_id}")
+            status_code, body, _, _ = parse_http_response(initial_data)
 
-            if status_code == 503:
-                any_busy = True
-                log_message(f"Server {port} is busy. Trying next...")
-                sock.close()
-                continue
-
-            elif status_code != 200:
-                sock.close()
-                with LOCK:
-                    STATS["failed_requests"] += 1
-                return_to_client(CPPStatus.INTERNAL_ERROR.value, body, client_id)
+            if status_code != 200:
+                return_to_client(
+                    CPPStatus.INTERNAL_ERROR.value,
+                    body if body else b"B-network status error.",
+                    client_id,
+                    resource,
+                    request_id,
+                )
                 return
 
             with LOCK:
                 STATS["successful_requests"] += 1
-                if index > 0:
-                    STATS["failover_count"] += 1
 
-            if port != backend_ports[0]:
-                with LOCK:
-                    SESSION_MAP[client_id][resource] = port
-
-            if not is_chunked:
-                return_to_client(CPPStatus.SUCCESS_DONE.value, body, client_id)
-                sock.close()
-            else:
-                is_done = False
-                while not is_done:
-                    chunk_data, is_done = read_http_chunk(sock)
-                    if chunk_data:
-                        return_to_client(CPPStatus.SUCCESS_PARTIAL.value, chunk_data, client_id)
-                    else:
-                        return_to_client(CPPStatus.SUCCESS_DONE.value, b"", client_id)
-                sock.close()
-
+            return_to_client(
+                CPPStatus.SUCCESS_DONE.value,
+                body,
+                client_id,
+                resource,
+                request_id,
+            )
             return
 
-        except (ConnectionRefusedError, socket.timeout):
-            any_unreachable = True
-            log_message(f"Server {port} unreachable. Trying next...")
-            continue
+        except (ConnectionRefusedError, socket.timeout, OSError):
+            with LOCK:
+                STATS["failed_requests"] += 1
+            return_to_client(
+                CPPStatus.SERVER_UNREACHABLE.value,
+                b"B-network gateway unreachable.",
+                client_id,
+                resource,
+                request_id,
+            )
+            return
 
+        except Exception as exc:
+            with LOCK:
+                STATS["failed_requests"] += 1
+                STATS["internal_errors"] += 1
+            return_to_client(
+                CPPStatus.INTERNAL_ERROR.value,
+                f"Interop proxy error: {exc}".encode(),
+                client_id,
+                resource,
+                request_id,
+            )
+            return
+
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+    service_id = map_resource_to_service(resource)
+    interop_session_id = f"interop-{client_id}-{request_id}"
+
+    session_key = (client_id, resource)
     with LOCK:
-        STATS["failed_requests"] += 1
+        b_session_id = B_SESSION_BY_CLIENT_RESOURCE.get(session_key)
+        if b_session_id is None:
+            b_session_id = f"b-session-{client_id}-{resource.value}"
+            B_SESSION_BY_CLIENT_RESOURCE[session_key] = b_session_id
 
-    if any_busy and any_unreachable:
-        return_to_client(CPPStatus.SERVER_BUSY.value, b"", client_id)
-    elif any_busy:
-        return_to_client(CPPStatus.SERVER_BUSY.value, b"", client_id)
-    else:
-        return_to_client(CPPStatus.SERVER_UNREACHABLE.value, b"", client_id)
+        COMPOUND_SESSION_MAP[(client_id, request_id)] = {
+            "a_client_id": client_id,
+            "a_request_id": request_id,
+            "a_resource": resource.name,
+            "b_service_id": service_id,
+            "b_session_id": b_session_id,
+            "interop_session_id": interop_session_id,
+        }
 
-def return_to_client(status_code: int, body: bytes, client_id: int) -> None:
-    response = encode_cpp(source_id=client_config.proxy_id, resource=Resource.PAGE, payload=body.decode(), status=CPPStatus(status_code))
-    send_cpp_packet(client_id, response)
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(TIMEOUT)
+        sock.connect((gateway_host, gateway_port))
+        sock.sendall(
+            build_gateway_request(
+                f"/service/{service_id}",
+                {
+                    "X-A-Client-ID": str(client_id),
+                    "X-A-Request-ID": str(request_id),
+                    "X-Interop-Session-ID": interop_session_id,
+                    "X-B-Session-ID": b_session_id,
+                },
+            )
+        )
+
+        initial_data = sock.recv(BUFFER_SIZE)
+        status_code, body, is_chunked, _ = parse_http_response(initial_data)
+
+        if status_code == 503:
+            with LOCK:
+                STATS["failed_requests"] += 1
+            return_to_client(
+                CPPStatus.SERVER_BUSY.value,
+                body if body else b"B-network busy.",
+                client_id,
+                resource,
+                request_id,
+            )
+            return
+
+        if status_code != 200:
+            with LOCK:
+                STATS["failed_requests"] += 1
+            return_to_client(
+                CPPStatus.INTERNAL_ERROR.value,
+                body if body else b"Interop proxy received B-network error.",
+                client_id,
+                resource,
+                request_id,
+            )
+            return
+
+        with LOCK:
+            STATS["successful_requests"] += 1
+
+        if not is_chunked:
+            return_to_client(
+                CPPStatus.SUCCESS_DONE.value,
+                body,
+                client_id,
+                resource,
+                request_id,
+            )
+        else:
+            stream_chunks_to_client(
+                sock,
+                client_id,
+                resource,
+                request_id,
+                body,
+            )
+
+    except (ConnectionRefusedError, socket.timeout, OSError):
+        with LOCK:
+            STATS["failed_requests"] += 1
+        return_to_client(
+            CPPStatus.SERVER_UNREACHABLE.value,
+            b"B-network gateway unreachable.",
+            client_id,
+            resource,
+            request_id,
+        )
+
+    except Exception as exc:
+        with LOCK:
+            STATS["failed_requests"] += 1
+            STATS["internal_errors"] += 1
+        return_to_client(
+            CPPStatus.INTERNAL_ERROR.value,
+            f"Interop proxy forwarding error: {exc}".encode(),
+            client_id,
+            resource,
+            request_id,
+        )
+
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
 
 def handle_client(data: bytes, client_id: int) -> None:
+    acquired = WORKER_SEMAPHORE.acquire(blocking=False)
+    if not acquired:
+        with LOCK:
+            STATS["proxy_busy"] += 1
+
+        try:
+            request_obj = decode_cpp(data)
+            return_to_client(
+                CPPStatus.PROXY_BUSY.value,
+                b"",
+                client_id,
+                request_obj["resource"],
+                request_obj["request_id"],
+            )
+        except Exception:
+            pass
+        return
+
+    request_obj = None
+
     try:
         if not client_config.is_authorized(client_id):
-            log_message(f"Unauthorized client {client_id} tried to send data; dropping packet.")
             with LOCK:
-                STATS["unauthorized_requests"] += 1
+                STATS["failed_requests"] += 1
             return
 
-        raw_data = data
-        if not raw_data:
+        if not data:
             return
 
         with LOCK:
@@ -326,7 +440,11 @@ def handle_client(data: bytes, client_id: int) -> None:
 
         try:
             request_obj = decode_cpp(data)
-            log_message(f"Received request from client {client_id} for resource {Resource(request_obj['resource']).name}")
+            log_message(
+                f"Received A-network request from client {client_id} "
+                f"for resource {request_obj['resource'].name}, "
+                f"request_id={request_obj['request_id']}"
+            )
         except CPPDecodeError as e:
             with LOCK:
                 STATS["failed_requests"] += 1
@@ -335,21 +453,66 @@ def handle_client(data: bytes, client_id: int) -> None:
                 return_to_client(
                     CPPStatus.INVALID_REQUEST.value,
                     str(e).encode(),
-                    target_client_id
+                    target_client_id,
+                    Resource.PAGE,
+                    0,
                 )
             return
 
-        forward_to_backend(request_obj['source_id'], request_obj['resource'])
+        forward_to_b_network(
+            request_obj["source_id"],
+            request_obj["resource"],
+            request_obj["request_id"],
+        )
 
     except Exception as exc:
-        log_message(f"Proxy error handling client {client_id}: {exc}")
         with LOCK:
             STATS["failed_requests"] += 1
+            STATS["internal_errors"] += 1
+
+        try:
+            resource = request_obj["resource"] if request_obj else Resource.PAGE
+            request_id = request_obj["request_id"] if request_obj else 0
+            return_to_client(
+                CPPStatus.INTERNAL_ERROR.value,
+                f"Interop proxy internal error: {exc}".encode(),
+                client_id,
+                resource,
+                request_id,
+            )
+        except Exception:
+            pass
+
+    finally:
+        WORKER_SEMAPHORE.release()
+
+
+def resolve_proxy_id() -> int:
+    if len(sys.argv) == 1:
+        return client_config.proxy_id
+
+    if len(sys.argv) == 2:
+        try:
+            return int(sys.argv[1])
+        except ValueError:
+            sys.exit("Proxy ID must be an integer.")
+
+    sys.exit("Usage: python proxy.py <proxy_id>")
 
 
 def main() -> None:
-    log_message(f"Proxy listening on {HOST}:{client_config.proxy_port}")
-    setup_underlay(client_config.proxy_id)
+    global CURRENT_PROXY_ID
+
+    CURRENT_PROXY_ID = resolve_proxy_id()
+
+    if CURRENT_PROXY_ID not in client_config.proxy_ids:
+        sys.exit(f"Invalid proxy ID: {CURRENT_PROXY_ID}")
+
+    proxy_port = client_config.get_proxy_port(CURRENT_PROXY_ID)
+    log_message(
+        f"Interoperation proxy {CURRENT_PROXY_ID} listening on UDP underlay port {proxy_port}"
+    )
+    setup_underlay(CURRENT_PROXY_ID)
 
     try:
         while True:
@@ -357,22 +520,20 @@ def main() -> None:
                 data, client_id = proxy_receive_cpp_packet()
             except CPPDecodeError as e:
                 log_message(f"Failed to extract client_id: {e}")
-                with LOCK:
-                    STATS["failed_requests"] += 1
                 continue
-            
+
             if data is None or client_id is None:
                 continue
 
             thread = threading.Thread(
                 target=handle_client,
                 args=(data, client_id),
-                daemon=True
+                daemon=True,
             )
             thread.start()
 
     except KeyboardInterrupt:
-        log_message("Proxy shutting down.")
+        log_message(f"Interoperation proxy {CURRENT_PROXY_ID} shutting down.")
         log_message(f"Final stats: {STATS}")
     finally:
         cleanup_underlay()

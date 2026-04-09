@@ -1,7 +1,7 @@
 {
-    "proxy": {
-        "id": 0,
-        "port": 8000
-    },
-    "client_ids": [1, 2, 3]
+  "proxies": [
+    { "id": 0, "port": 8000 },
+    { "id": 4, "port": 8001 }
+  ],
+  "client_ids": [1, 2, 3]
 }
