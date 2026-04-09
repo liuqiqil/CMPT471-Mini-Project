@@ -1,9 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
-from enum import Enum
 import logging
 import os
 import socket
-import threading
 import sys
 import time
 from utils.network_config import ServerNetworkConfig
@@ -158,6 +156,7 @@ def handle_client_connection(client_connection: socket.socket, server_port: int,
         
 def start_server(port: int, content_type: Resource) -> None:
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((HOST, port))
     server_socket.listen(MAX_CONNECTIONS)
     log_message(port, f"Server for {content_type.name} started on port {port}")
@@ -187,25 +186,21 @@ def start_server(port: int, content_type: Resource) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) != 1:
-        sys.exit("Usage: python backend_server.py")
+    if len(sys.argv) != 3:
+        sys.exit("Usage: python backend_server.py <port> <resource_name>")
     
-    threads = []
-    for content_type, port in config.server_ports:
-        t =threading.Thread(
-            target=start_server,
-            args=(port, content_type),
-            daemon=True
-        )
-        t.start()
-        threads.append(t)
-        print(f"Started server for {content_type} on port {port}")
+    port = int(sys.argv[1])
+    resource_name = sys.argv[2].upper()
+    
     try:
-        while any(t.is_alive() for t in threads):
-            time.sleep(1) 
-    except KeyboardInterrupt:
-        print("\nShutting down.")
+        content_type = Resource[resource_name]
+    except KeyError:
+        sys.exit(f"Invalid resource: {resource_name}")
 
+    try:
+        start_server(port, content_type)
+    except KeyboardInterrupt:
+        print(f"\nServer on port {port} shutting down.")
 
 if __name__ == "__main__":
     main()

@@ -6,20 +6,22 @@
 - client.py
 - proxy.py
 - backend_server.py
+- server_manager.py
+- utils
+- tests
 
 ## How to Run
-1. Start backend servers
-2. Start proxy
-3. Run client
+1. Change network configs if you like
+2. Start server_manager
+3. Start proxy
+4. Run client
 
 ## Example
 Terminal 1:
-Terminal 1 (Backend Server 1):
-python backend_server.py 8001 Server1
-Terminal 2 (Backend Server 2):
-python backend_server.py 8002 Server2
-Terminal 3 (proxy):
+Terminal 1 (Server Manager):
+python server_manager.py
+Terminal 2 (proxy):
 python proxy.py
-Terminal 4 (client):
-python client.py client1 /test
+Terminal 3 (client):
+python client.py 1 stream
 You can run additional clients (e.g., client2) to observe session behaviour and load distribution.

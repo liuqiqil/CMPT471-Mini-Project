@@ -225,7 +225,7 @@ def forward_to_backend(client_id: int, resource: Resource):
         )
 
         final_body = "\n".join(lines + [total_line])
-        return_to_client(CPPStatus.SUCCESS.value, final_body.encode(), client_id)
+        return_to_client(CPPStatus.SUCCESS_DONE.value, final_body.encode(), client_id)
         with LOCK:
             STATS["successful_requests"] += 1
         return
@@ -276,14 +276,16 @@ def forward_to_backend(client_id: int, resource: Resource):
                     SESSION_MAP[client_id][resource] = port
 
             if not is_chunked:
-                return_to_client(CPPStatus.SUCCESS.value, body, client_id)
+                return_to_client(CPPStatus.SUCCESS_DONE.value, body, client_id)
                 sock.close()
             else:
                 is_done = False
                 while not is_done:
                     chunk_data, is_done = read_http_chunk(sock)
                     if chunk_data:
-                        return_to_client(CPPStatus.SUCCESS.value, chunk_data, client_id)
+                        return_to_client(CPPStatus.SUCCESS_PARTIAL.value, chunk_data, client_id)
+                    else:
+                        return_to_client(CPPStatus.SUCCESS_DONE.value, b"", client_id)
                 sock.close()
 
             return

@@ -1,17 +1,17 @@
 import json
 import os
-from utils.globals import Resource
+from utils.globals import Resource, CLIENT_CONFIG_PATH, SERVER_CONFIG_PATH
 
 class ConfigBase:
-    def __init__(self, filename):
+    def __init__(self, filepath: str):
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.join(base_dir, f"../configs/{filename}")
+        config_path = os.path.join(base_dir, filepath)
         with open(config_path, "r") as f:
             self._data = json.load(f)
 
 class ServerNetworkConfig(ConfigBase):
     def __init__(self):
-        super().__init__("server_network_config.json")
+        super().__init__(SERVER_CONFIG_PATH)
         
     @property
     def proxy_auth_token(self):
@@ -36,7 +36,7 @@ class ServerNetworkConfig(ConfigBase):
 
 class ClientNetworkConfig(ConfigBase):
     def __init__(self):
-        super().__init__("client_network_config.json")
+        super().__init__(CLIENT_CONFIG_PATH)
 
     @property
     def proxy_id(self):

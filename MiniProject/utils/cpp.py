@@ -5,12 +5,13 @@ from utils.globals import Resource
 # Used only by the proxy to communicate the status of the request back to the client
 # SERVER_BUSY and SERVER_UNREACHABLE are only returned by non-ping requests!
 class CPPStatus(Enum):
-    SUCCESS = 0
-    SERVER_BUSY = 1
-    SERVER_UNREACHABLE = 2
-    PROXY_BUSY = 3
-    INVALID_REQUEST = 4
-    INTERNAL_ERROR = 5
+    SUCCESS_DONE = 0
+    SUCCESS_PARTIAL = 1 # Indicates that the stream is not done!
+    SERVER_BUSY = 2
+    SERVER_UNREACHABLE = 3
+    PROXY_BUSY = 4
+    INVALID_REQUEST = 5
+    INTERNAL_ERROR = 6
 
 # We use an unassigned protocol number for the ID. Source: https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
 PROTOCOL_ID = 148
@@ -23,7 +24,7 @@ class CPPDecodeError(Exception):
         super().__init__(message)
         self.source_id = source_id
 
-def encode_cpp(source_id: int, resource: Resource, payload: str = "", status: CPPStatus = CPPStatus.SUCCESS) -> bytes:
+def encode_cpp(source_id: int, resource: Resource, payload: str = "", status: CPPStatus = CPPStatus.SUCCESS_DONE) -> bytes:
     if not (0 <= source_id <= 255):
         raise ValueError("Source ID must be between 0 and 255")
     
