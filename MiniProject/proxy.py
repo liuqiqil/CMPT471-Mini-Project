@@ -4,12 +4,10 @@ import socket
 import threading
 from typing import Dict, List, Tuple, Optional
 from utils.network_config import ClientNetworkConfig, ServerNetworkConfig
-from utils.globals import HOST, BUFFER_SIZE, LOGGING_DIR, Resource, base64_encode
+from utils.globals import HOST, BUFFER_SIZE, TIMEOUT, Resource, base64_encode
 from backend_server import PATH_DB
-from utils.cpp import CPPStatus, encode_cpp, decode_cpp, CPPDecodeError, get_cpp_sender_id
-from utils.client_transport_underlay import send_cpp_packet, update_client_port
-
-SOCKET_TIMEOUT = 5
+from utils.cpp import CPPStatus, encode_cpp, decode_cpp, CPPDecodeError
+from utils.client_transport_underlay import cleanup_underlay, proxy_receive_cpp_packet, send_cpp_packet, setup_underlay
 
 # Simple session map
 SESSION_MAP: Dict[int, Dict[Resource, int]] = {}
@@ -29,7 +27,6 @@ LOCK = threading.Lock()
 
 server_config = ServerNetworkConfig()
 client_config = ClientNetworkConfig()
-proxy_server = None
 
 
 def log_message(message: str) -> None:
@@ -154,7 +151,7 @@ def forward_to_backend(client_id: int, resource: Resource):
         def ping_server(port):
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                    sock.settimeout(SOCKET_TIMEOUT)
+                    sock.settimeout(TIMEOUT)
                     sock.connect((HOST, port))
                     sock.sendall(payload)
                     initial_data = sock.recv(BUFFER_SIZE)
@@ -228,7 +225,9 @@ def forward_to_backend(client_id: int, resource: Resource):
         )
 
         final_body = "\n".join(lines + [total_line])
-        return_to_client(CPPStatus.SUCCESS.value, final_body.encode(), client_id)
+        return_to_client(CPPStatus.SUCCESS_DONE.value, final_body.encode(), client_id)
+        with LOCK:
+            STATS["successful_requests"] += 1
         return
 
     # Non-PING resources
@@ -246,7 +245,7 @@ def forward_to_backend(client_id: int, resource: Resource):
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((HOST, port))
-            sock.settimeout(SOCKET_TIMEOUT)
+            sock.settimeout(TIMEOUT)
             sock.sendall(payload)
 
             log_message(f"Sent request for resource {resource.name} from client {client_id} to backend server on port {port}")
@@ -277,14 +276,16 @@ def forward_to_backend(client_id: int, resource: Resource):
                     SESSION_MAP[client_id][resource] = port
 
             if not is_chunked:
-                return_to_client(CPPStatus.SUCCESS.value, body, client_id)
+                return_to_client(CPPStatus.SUCCESS_DONE.value, body, client_id)
                 sock.close()
             else:
                 is_done = False
                 while not is_done:
                     chunk_data, is_done = read_http_chunk(sock)
                     if chunk_data:
-                        return_to_client(CPPStatus.SUCCESS.value, chunk_data, client_id)
+                        return_to_client(CPPStatus.SUCCESS_PARTIAL.value, chunk_data, client_id)
+                    else:
+                        return_to_client(CPPStatus.SUCCESS_DONE.value, b"", client_id)
                 sock.close()
 
             return
@@ -306,7 +307,7 @@ def forward_to_backend(client_id: int, resource: Resource):
 
 def return_to_client(status_code: int, body: bytes, client_id: int) -> None:
     response = encode_cpp(source_id=client_config.proxy_id, resource=Resource.PAGE, payload=body.decode(), status=CPPStatus(status_code))
-    send_cpp_packet(client_id, response, proxy_server)
+    send_cpp_packet(client_id, response)
 
 def handle_client(data: bytes, client_id: int) -> None:
     try:
@@ -347,25 +348,21 @@ def handle_client(data: bytes, client_id: int) -> None:
 
 
 def main() -> None:
-    global proxy_server
     log_message(f"Proxy listening on {HOST}:{client_config.proxy_port}")
-    proxy_server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    proxy_server.bind((HOST, client_config.proxy_port))
-
+    setup_underlay(client_config.proxy_id)
 
     try:
         while True:
-            data, addr = proxy_server.recvfrom(BUFFER_SIZE)
-
             try:
-                client_id = get_cpp_sender_id(data)
+                data, client_id = proxy_receive_cpp_packet()
             except CPPDecodeError as e:
-                log_message(f"Failed to extract client_id from {addr}: {e}")
+                log_message(f"Failed to extract client_id: {e}")
                 with LOCK:
                     STATS["failed_requests"] += 1
                 continue
-
-            update_client_port(client_id, addr[1])
+            
+            if data is None or client_id is None:
+                continue
 
             thread = threading.Thread(
                 target=handle_client,
@@ -378,7 +375,7 @@ def main() -> None:
         log_message("Proxy shutting down.")
         log_message(f"Final stats: {STATS}")
     finally:
-        proxy_server.close()
+        cleanup_underlay()
 
 
 if __name__ == "__main__":

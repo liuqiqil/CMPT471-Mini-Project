@@ -2,22 +2,18 @@ from concurrent.futures import ThreadPoolExecutor
 import logging
 import os
 import socket
-import threading
 import sys
 import time
 from utils.network_config import ServerNetworkConfig
-from utils.globals import Resource, HOST, STREAM_RESPONSE_COUNT, STREAM_RESPONSE_INTERVAL, base64_encode
+from utils.globals import Resource, HOST, STREAM_RESPONSE_COUNT, STREAM_RESPONSE_INTERVAL, BUFFER_SIZE, LOGGING_DIR, base64_encode
 from typing import Dict
 
-BUFFER_SIZE = 4096
-MAX_WAITING = 10
 MAX_CONNECTIONS = 5
-LOGGING_PATH = "logs"
 
-PATH_DB: Dict[str, Resource] = {
-    "/ping": Resource.PING,
-    "/page": Resource.PAGE,
-    "/stream": Resource.STREAM
+PATH_DB = {
+    Resource.PING: "/ping",
+    Resource.PAGE: "/page",
+    Resource.STREAM: "/stream"
 }
 
 RESPONSE_DB: Dict[Resource, str] = {
@@ -33,7 +29,7 @@ loggers = {}
 def log_message(server_port: int, message: str) -> None:
     if server_port not in loggers:
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        log_dir = os.path.join(base_dir, LOGGING_PATH)
+        log_dir = os.path.join(base_dir, LOGGING_DIR)
         os.makedirs(log_dir, exist_ok=True)
         log_file_path = os.path.join(log_dir, f"server_{server_port}.log")
 
@@ -133,7 +129,7 @@ def handle_client_connection(client_connection: socket.socket, server_port: int,
             log_message(server_port, f"403 Forbidden: Invalid Token - Received: {auth_header}, Expected: {EXPECTED_TOKEN}")
             return
 
-        if path in PATH_DB and PATH_DB[path] == content_type:
+        if path == PATH_DB[Resource.PING] or (content_type in PATH_DB and PATH_DB[content_type] == path):
             body = RESPONSE_DB[content_type]
             if content_type == Resource.STREAM:
                 for i in range(STREAM_RESPONSE_COUNT):
@@ -160,6 +156,7 @@ def handle_client_connection(client_connection: socket.socket, server_port: int,
         
 def start_server(port: int, content_type: Resource) -> None:
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_socket.bind((HOST, port))
     server_socket.listen(MAX_CONNECTIONS)
     log_message(port, f"Server for {content_type.name} started on port {port}")
@@ -169,6 +166,14 @@ def start_server(port: int, content_type: Resource) -> None:
                 try:
                     client_conn, client_addr = server_socket.accept()
                     log_message(port, f"Accepted connection from port {client_addr[1]}")
+                    
+                    # Send simple server full response if max connections are reached
+                    if len(executor._threads) >= MAX_CONNECTIONS:
+                        log_message(port, "Server Full. Sending 503.")
+                        busy_resp = build_standard_http_response("HTTP/1.1 503 Service Unavailable", "Server Busy")
+                        client_conn.sendall(busy_resp)
+                        client_conn.close()
+                        continue
                     
                     executor.submit(
                         handle_client_connection, 
@@ -181,25 +186,21 @@ def start_server(port: int, content_type: Resource) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) != 1:
-        sys.exit("Usage: python backend_server.py")
+    if len(sys.argv) != 3:
+        sys.exit("Usage: python backend_server.py <port> <resource_name>")
     
-    threads = []
-    for content_type, port in config.server_ports:
-        t =threading.Thread(
-            target=start_server,
-            args=(port, Resource[content_type]),
-            daemon=True
-        )
-        t.start()
-        threads.append(t)
-        print(f"Started server for {content_type} on port {port}")
+    port = int(sys.argv[1])
+    resource_name = sys.argv[2].upper()
+    
     try:
-        while any(t.is_alive() for t in threads):
-            time.sleep(1) 
-    except KeyboardInterrupt:
-        print("\nShutting down.")
+        content_type = Resource[resource_name]
+    except KeyError:
+        sys.exit(f"Invalid resource: {resource_name}")
 
+    try:
+        start_server(port, content_type)
+    except KeyboardInterrupt:
+        print(f"\nServer on port {port} shutting down.")
 
 if __name__ == "__main__":
     main()
