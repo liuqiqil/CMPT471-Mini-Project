@@ -319,7 +319,6 @@ def forward_to_b_network(client_id: int, resource: Resource, request_id: int) ->
             build_gateway_request(
                 f"/service/{service_id}",
                 {
-                    "X-A-Client-ID": str(client_id),
                     "X-A-Request-ID": str(request_id),
                     "X-Interop-Session-ID": interop_session_id,
                     "X-B-Session-ID": b_session_id,
