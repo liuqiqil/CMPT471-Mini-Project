@@ -289,8 +289,8 @@ def build_status_body() -> str:
 
         lines.append(
             f"{service_id}: "
-            f"{pct(available, total)}% ({available}/{total}) available, "
-            f"{pct(busy, total)}% ({busy}/{total}) busy, "
+            f"{pct(available, total)}% ({available}/{total}) reachable, "
+            # f"{pct(busy, total)}% ({busy}/{total}) busy, "
             f"{pct(unreachable, total)}% ({unreachable}/{total}) unreachable"
         )
 
