@@ -1,313 +1,541 @@
+from datetime import datetime
 import socket
+import sys
 import threading
-import time
-from typing import Dict, Tuple, Optional
+from typing import Dict, Optional
 
-from utils.cpp import decode_cpp, encode_cpp
-from utils.globals import Resource, HOST, base64_encode
+from utils.client_transport_underlay import (
+    cleanup_underlay,
+    proxy_receive_cpp_packet,
+    send_cpp_packet,
+    setup_underlay,
+)
+from utils.cpp import CPPDecodeError, CPPStatus, decode_cpp, encode_cpp
+from utils.globals import BUFFER_SIZE, Resource, TIMEOUT, base64_encode
 from utils.network_config import ClientNetworkConfig, ServerNetworkConfig
-from utils.client_transport_underlay import send_cpp_packet, update_client_port
 
-BUFFER_SIZE = 4096
-SOCKET_TIMEOUT = 5
+MAX_PROXY_WORKERS = 20
+WORKER_SEMAPHORE = threading.BoundedSemaphore(MAX_PROXY_WORKERS)
 
-client_config = ClientNetworkConfig()
-server_config = ServerNetworkConfig()
-
-# track the most recent UDP address for each authorized client
-CLIENT_ADDRESS_MAP: Dict[int, Tuple[str, int]] = {}
-
-ROUND_ROBIN_INDEX: Dict[Resource, int] = {
-    Resource.PING: 0,
-    Resource.PAGE: 0,
-    Resource.STREAM: 0,
-}
+LOCK = threading.Lock()
 
 STATS = {
     "total_requests": 0,
     "successful_requests": 0,
     "failed_requests": 0,
+    "proxy_busy": 0,
+    "internal_errors": 0,
 }
 
-LOCK = threading.Lock()
+# Compound session table
+COMPOUND_SESSION_MAP: Dict[tuple[int, int], dict] = {}
+B_SESSION_BY_CLIENT_RESOURCE: Dict[tuple[int, Resource], str] = {}
 
-RESOURCE_TO_PATH = {
-    Resource.PING: "/ping",
-    Resource.PAGE: "/page",
-    Resource.STREAM: "/stream",
-}
+server_config = ServerNetworkConfig()
+client_config = ClientNetworkConfig()
+CURRENT_PROXY_ID: Optional[int] = None
 
 
 def log_message(message: str) -> None:
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {message}")
+    timestamp = datetime.now().strftime("%a %b %d %H:%M:%S %Y")
+    thread_id = threading.get_ident()
+    print(f"[{timestamp}] [Thread:{thread_id}] {message}")
 
 
-def choose_backend_port(resource: Resource) -> Optional[int]:
-    ports = server_config.get_server_ports(resource.name)
-    if not ports:
-        return None
-
-    with LOCK:
-        index = ROUND_ROBIN_INDEX[resource]
-        chosen = ports[index % len(ports)]
-        ROUND_ROBIN_INDEX[resource] = (index + 1) % len(ports)
-
-    return chosen
-
-
-def build_http_request(resource: Resource) -> str:
-    path = RESOURCE_TO_PATH[resource]
-    auth_header = f"Basic {base64_encode(server_config.proxy_auth_token)}"
-
-    return (
-        f"GET {path} HTTP/1.1\r\n"
-        f"Host: {HOST}\r\n"
-        f"Authorization: {auth_header}\r\n"
-        f"Connection: close\r\n"
-        f"\r\n"
-    )
-
-
-def parse_http_status_and_headers(header_bytes: bytes) -> Tuple[int, Dict[str, str]]:
-    header_text = header_bytes.decode(errors="replace")
-    lines = header_text.split("\r\n")
-
+def parse_http_response(http_response: bytes):
     status_code = 500
-    headers: Dict[str, str] = {}
+    body = b""
+    is_chunked = False
+    headers = {}
 
+    separator = b"\r\n\r\n"
+    if separator in http_response:
+        header_section, body = http_response.split(separator, 1)
+    else:
+        header_section = http_response
+
+    lines = header_section.split(b"\r\n")
     if lines:
         parts = lines[0].split()
         if len(parts) >= 2 and parts[1].isdigit():
             status_code = int(parts[1])
 
-    for line in lines[1:]:
-        if ":" in line:
-            key, value = line.split(":", 1)
-            headers[key.strip().lower()] = value.strip()
+        for line in lines[1:]:
+            if b":" in line:
+                key, value = line.split(b":", 1)
+                decoded_key = key.strip().decode().lower()
+                decoded_value = value.strip().decode()
+                headers[decoded_key] = decoded_value
+                if decoded_key == "transfer-encoding" and "chunked" in decoded_value.lower():
+                    is_chunked = True
 
-    return status_code, headers
+    return status_code, body, is_chunked, headers
 
 
-def send_error_response(
-    proxy_socket: socket.socket,
+def read_http_chunk(sock: socket.socket):
+    def read_until(delimiter: bytes) -> bytes:
+        data = b""
+        while not data.endswith(delimiter):
+            char = sock.recv(1)
+            if not char:
+                break
+            data += char
+        return data
+
+    size_line = read_until(b"\r\n").strip()
+    if not size_line:
+        return b"", True
+
+    try:
+        chunk_size = int(size_line, 16)
+    except ValueError:
+        return b"", True
+
+    if chunk_size == 0:
+        read_until(b"\r\n")
+        return b"", True
+
+    chunk_data = b""
+    while len(chunk_data) < chunk_size:
+        chunk_data += sock.recv(chunk_size - len(chunk_data))
+
+    read_until(b"\r\n")
+    return chunk_data, False
+
+
+def try_parse_one_chunk_from_buffer(buffer: bytes) -> tuple[bytes | None, bytes, bool]:
+    sep = b"\r\n"
+    idx = buffer.find(sep)
+    if idx == -1:
+        return None, buffer, False
+
+    size_line = buffer[:idx]
+    try:
+        chunk_size = int(size_line.decode(), 16)
+    except ValueError:
+        return None, buffer, False
+
+    needed = idx + 2 + chunk_size + 2
+    if len(buffer) < needed:
+        return None, buffer, False
+
+    chunk_start = idx + 2
+    chunk_end = chunk_start + chunk_size
+    chunk_data = buffer[chunk_start:chunk_end]
+    trailer = buffer[chunk_end:chunk_end + 2]
+    if trailer != b"\r\n":
+        return None, buffer, False
+
+    remaining = buffer[needed:]
+
+    if chunk_size == 0:
+        return b"", remaining, True
+
+    return chunk_data, remaining, False
+
+
+def return_to_client(
+    status_code: int,
+    body: bytes,
     client_id: int,
     resource: Resource,
-    error_msg: str
+    request_id: int,
 ) -> None:
-    response_packet = encode_cpp(
-        source_id=client_config.proxy_id,
+    if CURRENT_PROXY_ID is None:
+        raise RuntimeError("Current proxy ID is not initialized")
+
+    response = encode_cpp(
+        source_id=CURRENT_PROXY_ID,
         resource=resource,
-        payload=f"ERROR: {error_msg}"
+        payload=body.decode(errors="replace"),
+        status=CPPStatus(status_code),
+        request_id=request_id,
     )
-    send_cpp_packet(dest_id=client_id, message=response_packet, socket=proxy_socket)
+    send_cpp_packet(client_id, response)
 
 
-def forward_standard_response(
-    backend_socket: socket.socket,
-    initial_body: bytes,
+def stream_chunks_to_client(
+    source_sock: socket.socket,
     client_id: int,
     resource: Resource,
-    proxy_socket: socket.socket
-) -> None:
-    body = initial_body
-
-    while True:
-        chunk = backend_socket.recv(BUFFER_SIZE)
-        if not chunk:
-            break
-        body += chunk
-
-    response_packet = encode_cpp(
-        source_id=client_config.proxy_id,
-        resource=resource,
-        payload=body.decode(errors="replace")
-    )
-    send_cpp_packet(dest_id=client_id, message=response_packet, socket=proxy_socket)
-
-
-def forward_chunked_response(
-    backend_socket: socket.socket,
+    request_id: int,
     initial_body: bytes,
-    client_id: int,
-    resource: Resource,
-    proxy_socket: socket.socket
 ) -> None:
     buffer = initial_body
+    done = False
 
-    while True:
-        # at least a chunk-size line
-        if b"\r\n" not in buffer:
-            chunk = backend_socket.recv(BUFFER_SIZE)
-            if not chunk:
+    while not done:
+        chunk_data, buffer, done = try_parse_one_chunk_from_buffer(buffer)
+
+        if chunk_data is None:
+            more = source_sock.recv(BUFFER_SIZE)
+            if not more:
                 break
-            buffer += chunk
+            buffer += more
             continue
 
-        size_line, rest = buffer.split(b"\r\n", 1)
+        if done:
+            return_to_client(
+                CPPStatus.SUCCESS_DONE.value,
+                b"",
+                client_id,
+                resource,
+                request_id,
+            )
+            break
 
+        if chunk_data:
+            return_to_client(
+                CPPStatus.SUCCESS_PARTIAL.value,
+                chunk_data,
+                client_id,
+                resource,
+                request_id,
+            )
+
+
+def map_resource_to_service(resource: Resource) -> str:
+    if resource == Resource.PAGE:
+        return server_config.get_service_id(Resource.PAGE)
+    if resource == Resource.STREAM:
+        return server_config.get_service_id(Resource.STREAM)
+    if resource == Resource.PING:
+        return "b.network.status"
+    raise ValueError(f"Unsupported resource: {resource}")
+
+
+def build_gateway_request(
+    path: str,
+    headers: Dict[str, str] | None = None,
+) -> bytes:
+    gateway_host, gateway_port = server_config.b_gateway_endpoint
+
+    header_lines = [
+        f"GET {path} HTTP/1.1",
+        f"Host: {gateway_host}:{gateway_port}",
+        f"Authorization: Basic {base64_encode(server_config.interop_auth_token)}",
+    ]
+
+    if headers:
+        for key, value in headers.items():
+            header_lines.append(f"{key}: {value}")
+
+    request = "\r\n".join(header_lines) + "\r\n\r\n"
+    return request.encode()
+
+
+def forward_to_b_network(client_id: int, resource: Resource, request_id: int) -> None:
+    gateway_host, gateway_port = server_config.b_gateway_endpoint
+
+    if resource == Resource.PING:
+        sock = None
         try:
-            chunk_size = int(size_line.decode().strip(), 16)
-        except ValueError:
-            raise ValueError("Malformed chunked response from backend")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(TIMEOUT)
+            sock.connect((gateway_host, gateway_port))
+            sock.sendall(build_gateway_request("/status"))
+            initial_data = sock.recv(BUFFER_SIZE)
+            status_code, body, _, _ = parse_http_response(initial_data)
 
-        # end of chunked stream
-        if chunk_size == 0:
+            if status_code != 200:
+                return_to_client(
+                    CPPStatus.INTERNAL_ERROR.value,
+                    body if body else b"B-network status error.",
+                    client_id,
+                    resource,
+                    request_id,
+                )
+                return
+
+            with LOCK:
+                STATS["successful_requests"] += 1
+
+            return_to_client(
+                CPPStatus.SUCCESS_DONE.value,
+                body,
+                client_id,
+                resource,
+                request_id,
+            )
             return
 
-        # full chunk data + trailing CRLF
-        required = chunk_size + 2
-        while len(rest) < required:
-            chunk = backend_socket.recv(BUFFER_SIZE)
-            if not chunk:
-                raise ValueError("Incomplete chunked response from backend")
-            rest += chunk
+        except (ConnectionRefusedError, socket.timeout, OSError):
+            with LOCK:
+                STATS["failed_requests"] += 1
+            return_to_client(
+                CPPStatus.SERVER_UNREACHABLE.value,
+                b"B-network gateway unreachable.",
+                client_id,
+                resource,
+                request_id,
+            )
+            return
 
-        chunk_data = rest[:chunk_size]
-        trailer = rest[chunk_size:chunk_size + 2]
+        except Exception as exc:
+            with LOCK:
+                STATS["failed_requests"] += 1
+                STATS["internal_errors"] += 1
+            return_to_client(
+                CPPStatus.INTERNAL_ERROR.value,
+                f"Interop proxy error: {exc}".encode(),
+                client_id,
+                resource,
+                request_id,
+            )
+            return
 
-        if trailer != b"\r\n":
-            raise ValueError("Invalid chunk terminator from backend")
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
 
-        buffer = rest[chunk_size + 2:]
+    service_id = map_resource_to_service(resource)
+    interop_session_id = f"interop-{client_id}-{request_id}"
 
-        response_packet = encode_cpp(
-            source_id=client_config.proxy_id,
-            resource=resource,
-            payload=chunk_data.decode(errors="replace")
-        )
-        send_cpp_packet(dest_id=client_id, message=response_packet, socket=proxy_socket)
+    session_key = (client_id, resource)
+    with LOCK:
+        b_session_id = B_SESSION_BY_CLIENT_RESOURCE.get(session_key)
+        if b_session_id is None:
+            b_session_id = f"b-session-{client_id}-{resource.value}"
+            B_SESSION_BY_CLIENT_RESOURCE[session_key] = b_session_id
 
+        COMPOUND_SESSION_MAP[(client_id, request_id)] = {
+            "a_client_id": client_id,
+            "a_request_id": request_id,
+            "a_resource": resource.name,
+            "b_service_id": service_id,
+            "b_session_id": b_session_id,
+            "interop_session_id": interop_session_id,
+        }
 
-def forward_to_backend(
-    resource: Resource,
-    client_id: int,
-    proxy_socket: socket.socket
-) -> int:
-    backend_port = choose_backend_port(resource)
-    if backend_port is None:
-        raise RuntimeError(f"No backend configured for resource {resource.name}")
-
-    http_request = build_http_request(resource)
-
-    backend_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    backend_socket.settimeout(SOCKET_TIMEOUT)
-
+    sock = None
     try:
-        backend_socket.connect((HOST, backend_port))
-        backend_socket.sendall(http_request.encode())
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(TIMEOUT)
+        sock.connect((gateway_host, gateway_port))
+        sock.sendall(
+            build_gateway_request(
+                f"/service/{service_id}",
+                {
+                    "X-A-Request-ID": str(request_id),
+                    "X-Interop-Session-ID": interop_session_id,
+                    "X-B-Session-ID": b_session_id,
+                },
+            )
+        )
 
-        response_buffer = b""
-        while b"\r\n\r\n" not in response_buffer:
-            chunk = backend_socket.recv(BUFFER_SIZE)
-            if not chunk:
-                raise RuntimeError("Backend closed connection before sending headers")
-            response_buffer += chunk
+        initial_data = sock.recv(BUFFER_SIZE)
+        status_code, body, is_chunked, _ = parse_http_response(initial_data)
 
-        header_bytes, initial_body = response_buffer.split(b"\r\n\r\n", 1)
-        status_code, headers = parse_http_status_and_headers(header_bytes)
+        if status_code == 503:
+            with LOCK:
+                STATS["failed_requests"] += 1
+            return_to_client(
+                CPPStatus.SERVER_BUSY.value,
+                body if body else b"B-network busy.",
+                client_id,
+                resource,
+                request_id,
+            )
+            return
 
         if status_code != 200:
-            error_body = initial_body
-            while True:
-                chunk = backend_socket.recv(BUFFER_SIZE)
-                if not chunk:
-                    break
-                error_body += chunk
-            raise RuntimeError(
-                f"Backend returned HTTP {status_code}: {error_body.decode(errors='replace')}"
+            with LOCK:
+                STATS["failed_requests"] += 1
+            return_to_client(
+                CPPStatus.INTERNAL_ERROR.value,
+                body if body else b"Interop proxy received B-network error.",
+                client_id,
+                resource,
+                request_id,
             )
-
-        transfer_encoding = headers.get("transfer-encoding", "").lower()
-
-        if transfer_encoding == "chunked":
-            forward_chunked_response(
-                backend_socket=backend_socket,
-                initial_body=initial_body,
-                client_id=client_id,
-                resource=resource,
-                proxy_socket=proxy_socket,
-            )
-        else:
-            forward_standard_response(
-                backend_socket=backend_socket,
-                initial_body=initial_body,
-                client_id=client_id,
-                resource=resource,
-                proxy_socket=proxy_socket,
-            )
-
-        return backend_port
-
-    finally:
-        backend_socket.close()
-
-
-def handle_cpp_request(
-    data: bytes,
-    addr: Tuple[str, int],
-    proxy_socket: socket.socket
-) -> None:
-    try:
-        packet = decode_cpp(data)
-    except Exception as exc:
-        log_message(f"Dropped malformed CPP packet from {addr}: {exc}")
-        return
-
-    client_id = packet["source_id"]
-    resource = packet["resource"]
-
-    if not client_config.is_authorized(client_id):
-        log_message(f"Dropped packet from unauthorized client ID {client_id}")
-        return
-
-    with LOCK:
-        STATS["total_requests"] += 1
-        CLIENT_ADDRESS_MAP[client_id] = addr
-
-    update_client_port(client_id, addr[1])
-    log_message(f"Received {resource.name} request from client {client_id} at {addr}")
-
-    try:
-        backend_port = forward_to_backend(resource, client_id, proxy_socket)
+            return
 
         with LOCK:
             STATS["successful_requests"] += 1
 
-        log_message(
-            f"Completed request for client {client_id} ({resource.name}) via backend port {backend_port}"
+        if not is_chunked:
+            return_to_client(
+                CPPStatus.SUCCESS_DONE.value,
+                body,
+                client_id,
+                resource,
+                request_id,
+            )
+        else:
+            stream_chunks_to_client(
+                sock,
+                client_id,
+                resource,
+                request_id,
+                body,
+            )
+
+    except (ConnectionRefusedError, socket.timeout, OSError):
+        with LOCK:
+            STATS["failed_requests"] += 1
+        return_to_client(
+            CPPStatus.SERVER_UNREACHABLE.value,
+            b"B-network gateway unreachable.",
+            client_id,
+            resource,
+            request_id,
         )
 
     except Exception as exc:
         with LOCK:
             STATS["failed_requests"] += 1
+            STATS["internal_errors"] += 1
+        return_to_client(
+            CPPStatus.INTERNAL_ERROR.value,
+            f"Interop proxy forwarding error: {exc}".encode(),
+            client_id,
+            resource,
+            request_id,
+        )
 
-        log_message(f"Error handling client {client_id} ({resource.name}): {exc}")
-        send_error_response(proxy_socket, client_id, resource, str(exc))
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+def handle_client(data: bytes, client_id: int) -> None:
+    acquired = WORKER_SEMAPHORE.acquire(blocking=False)
+    if not acquired:
+        with LOCK:
+            STATS["proxy_busy"] += 1
+
+        try:
+            request_obj = decode_cpp(data)
+            return_to_client(
+                CPPStatus.PROXY_BUSY.value,
+                b"",
+                client_id,
+                request_obj["resource"],
+                request_obj["request_id"],
+            )
+        except Exception:
+            pass
+        return
+
+    request_obj = None
+
+    try:
+        if not client_config.is_authorized(client_id):
+            with LOCK:
+                STATS["failed_requests"] += 1
+            return
+
+        if not data:
+            return
+
+        with LOCK:
+            STATS["total_requests"] += 1
+
+        try:
+            request_obj = decode_cpp(data)
+            log_message(
+                f"Received A-network request from client {client_id} "
+                f"for resource {request_obj['resource'].name}, "
+                f"request_id={request_obj['request_id']}"
+            )
+        except CPPDecodeError as e:
+            with LOCK:
+                STATS["failed_requests"] += 1
+            target_client_id = getattr(e, "source_id", client_id)
+            if target_client_id is not None:
+                return_to_client(
+                    CPPStatus.INVALID_REQUEST.value,
+                    str(e).encode(),
+                    target_client_id,
+                    Resource.PAGE,
+                    0,
+                )
+            return
+
+        forward_to_b_network(
+            request_obj["source_id"],
+            request_obj["resource"],
+            request_obj["request_id"],
+        )
+
+    except Exception as exc:
+        with LOCK:
+            STATS["failed_requests"] += 1
+            STATS["internal_errors"] += 1
+
+        try:
+            resource = request_obj["resource"] if request_obj else Resource.PAGE
+            request_id = request_obj["request_id"] if request_obj else 0
+            return_to_client(
+                CPPStatus.INTERNAL_ERROR.value,
+                f"Interop proxy internal error: {exc}".encode(),
+                client_id,
+                resource,
+                request_id,
+            )
+        except Exception:
+            pass
+
+    finally:
+        WORKER_SEMAPHORE.release()
+
+
+def resolve_proxy_id() -> int:
+    if len(sys.argv) == 1:
+        return client_config.proxy_id
+
+    if len(sys.argv) == 2:
+        try:
+            return int(sys.argv[1])
+        except ValueError:
+            sys.exit("Proxy ID must be an integer.")
+
+    sys.exit("Usage: python proxy.py <proxy_id>")
 
 
 def main() -> None:
-    proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    proxy_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    proxy_socket.bind((HOST, client_config.proxy_port))
+    global CURRENT_PROXY_ID
 
-    log_message(f"CPP proxy listening on UDP {HOST}:{client_config.proxy_port}")
+    CURRENT_PROXY_ID = resolve_proxy_id()
+
+    if CURRENT_PROXY_ID not in client_config.proxy_ids:
+        sys.exit(f"Invalid proxy ID: {CURRENT_PROXY_ID}")
+
+    proxy_port = client_config.get_proxy_port(CURRENT_PROXY_ID)
+    log_message(
+        f"Interoperation proxy {CURRENT_PROXY_ID} listening on UDP underlay port {proxy_port}"
+    )
+    setup_underlay(CURRENT_PROXY_ID)
 
     try:
         while True:
-            data, addr = proxy_socket.recvfrom(BUFFER_SIZE)
+            try:
+                data, client_id = proxy_receive_cpp_packet()
+            except CPPDecodeError as e:
+                log_message(f"Failed to extract client_id: {e}")
+                continue
+
+            if data is None or client_id is None:
+                continue
+
             thread = threading.Thread(
-                target=handle_cpp_request,
-                args=(data, addr, proxy_socket),
-                daemon=True
+                target=handle_client,
+                args=(data, client_id),
+                daemon=True,
             )
             thread.start()
 
     except KeyboardInterrupt:
-        log_message("Proxy shutting down.")
+        log_message(f"Interoperation proxy {CURRENT_PROXY_ID} shutting down.")
         log_message(f"Final stats: {STATS}")
     finally:
-        proxy_socket.close()
+        cleanup_underlay()
 
 
 if __name__ == "__main__":
