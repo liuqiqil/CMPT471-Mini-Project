@@ -246,7 +246,244 @@ def interop_system(tmp_path: Path):
 
         for proc in reversed(backend_procs):
             stop_process(proc)
+            
+def test_ping_normal(interop_system):
+    """
+    Test normal PING request flow across the full interop stack.
+    All B-endpoints are up, gateway is up, both proxies are up.
+    """
+    env = interop_system["env"]
+    result = run_client(1, "ping", env)
+    assert result.returncode == 0
+    assert "Request successful (Status code 0)" in result.stdout
+    assert "content.page" in result.stdout
+    assert "content.stream" in result.stdout
 
+
+def test_page_normal(interop_system):
+    """
+    Test normal PAGE request flow across the full interop stack.
+    """
+    env = interop_system["env"]
+    result = run_client(1, "page", env)
+    assert result.returncode == 0
+    assert "Request successful (Status code 0)" in result.stdout
+    assert "Welcome to the B-network content endpoint." in result.stdout
+
+
+def test_stream_normal(interop_system):
+    """
+    Test normal STREAM request flow across the full interop stack.
+    """
+    env = interop_system["env"]
+    result = run_client(1, "stream", env)
+    assert result.returncode == 0
+    assert result.stdout.count("Request partially successful (Status code 1)") == TEST_RESPONSE_COUNT
+    assert result.stdout.count("B-network streaming content...") == TEST_RESPONSE_COUNT
+    assert "Request successful (Status code 0)" in result.stdout
+
+
+def test_gateway_failover_on_backend_down(interop_system):
+    """
+    Test that the gateway fails over to the second backend when the first is killed.
+    The PAGE request should still succeed even with one backend down.
+    """
+    env = interop_system["env"]
+
+    # Kill first PAGE backend
+    stop_process(interop_system["backend_procs"][0])
+    time.sleep(0.1)
+
+    result = run_client(1, "page", env)
+    assert result.returncode == 0
+    assert "Request successful (Status code 0)" in result.stdout
+    assert "Welcome to the B-network content endpoint." in result.stdout
+
+
+def test_server_unreachable_when_all_backends_down(interop_system):
+    """
+    Test that when all backends for a resource are down, the gateway returns 504
+    which the proxy translates to INTERNAL_ERROR with an unreachable message.
+    """
+    env = interop_system["env"]
+
+    stop_process(interop_system["backend_procs"][0])
+    stop_process(interop_system["backend_procs"][1])
+    time.sleep(0.1)
+
+    result = run_client(1, "page", env)
+    assert result.returncode == 0
+    assert "Proxy 0 internal error. Status code 6." in result.stdout
+    assert "All B-network endpoints are unreachable." in result.stdout
+
+
+
+def test_session_stickiness_same_backend(interop_system):
+    """
+    Test that repeated requests from the same client are routed to the same backend.
+    Kill the first backend after establishing a session, verify the gateway
+    remaps the session to the surviving backend rather than failing entirely.
+    """
+    env = interop_system["env"]
+
+    result1 = run_client(1, "page", env)
+    assert result1.returncode == 0
+    assert "Request successful (Status code 0)" in result1.stdout
+
+    stop_process(interop_system["backend_procs"][0])
+    time.sleep(0.1)
+
+    result2 = run_client(1, "page", env)
+    assert result2.returncode == 0
+    assert "Request successful (Status code 0)" in result2.stdout
+
+
+def test_compound_session_isolation_between_clients(interop_system):
+    """
+    Test that two different clients maintain independent compound sessions.
+    Both should succeed concurrently without interfering with each other.
+    """
+    import threading
+
+    env = interop_system["env"]
+    results = {}
+
+    def run(client_id):
+        results[client_id] = run_client(client_id, "page", env)
+
+    threads = [threading.Thread(target=run, args=(cid,)) for cid in [1, 2, 3]]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    for client_id, result in results.items():
+        assert result.returncode == 0, f"Client {client_id} failed"
+        assert "Request successful (Status code 0)" in result.stdout, f"Client {client_id} got wrong response"
+
+
+def test_stream_interrupted_mid_stream(interop_system):
+    """
+    Test that the client handles a stream backend dying mid-stream gracefully,
+    reporting partial success without hanging or crashing.
+    """
+    import threading
+
+    env = interop_system["env"]
+    result_holder = {}
+
+    def run_stream():
+        result_holder["result"] = run_client(1, "stream", env)
+
+    t = threading.Thread(target=run_stream)
+    t.start()
+
+    time.sleep(0.3)
+    stop_process(interop_system["backend_procs"][2])
+    stop_process(interop_system["backend_procs"][3])
+
+    t.join(timeout=10)
+
+    result = result_holder.get("result")
+    assert result is not None
+    assert result.returncode == 0
+    assert "Request partially successful (Status code 1)" in result.stdout
+
+
+def test_round_robin_distributes_across_backends(interop_system):
+    """
+    Test that the gateway distributes PAGE requests across both backends
+    rather than always hitting the same one. Kill one backend and verify
+    requests still succeed, then kill the other and verify failure,
+    confirming both were in rotation.
+    """
+    env = interop_system["env"]
+
+    stop_process(interop_system["backend_procs"][0])
+    time.sleep(0.1)
+
+    result = run_client(1, "page", env)
+    assert result.returncode == 0
+    assert "Request successful (Status code 0)" in result.stdout
+
+    stop_process(interop_system["backend_procs"][1])
+    time.sleep(0.1)
+
+    result2 = run_client(2, "page", env)
+    assert result2.returncode == 0
+    assert "Proxy 0 internal error. Status code 6." in result2.stdout
+    assert "All B-network endpoints are unreachable." in result2.stdout
+
+
+def test_ping_fails_over_when_primary_proxy_down(interop_system):
+    """
+    Test that PING also fails over to the backup proxy when the primary is down.
+    """
+    env = interop_system["env"]
+
+    stop_process(interop_system["proxy0_proc"])
+    time.sleep(0.1)
+
+    result = run_client(1, "ping", env)
+    assert result.returncode == 0
+    assert "Proxy 0 timed out." in result.stdout
+    assert "Failing over to next proxy: 4" in result.stdout
+    assert "Request successful (Status code 0)" in result.stdout
+
+def test_ping_with_one_backend_down(interop_system):
+    """
+    Test PING response when one PAGE backend is down.
+    The ping should still succeed and report partial availability for content.page.
+    """
+    env = interop_system["env"]
+
+    stop_process(interop_system["backend_procs"][0])
+    time.sleep(0.1)
+
+    result = run_client(1, "ping", env)
+    assert result.returncode == 0
+    assert "Request successful (Status code 0)" in result.stdout
+    # One of two PAGE backends is down — should show partial availability
+    assert "content.page" in result.stdout
+    assert "50%" in result.stdout
+
+
+def test_ping_with_all_backends_of_one_type_down(interop_system):
+    """
+    Test PING response when all PAGE backends are down but STREAM backends are up.
+    The ping should still succeed and report 0% for content.page, 100% for content.stream.
+    """
+    env = interop_system["env"]
+
+    stop_process(interop_system["backend_procs"][0])
+    stop_process(interop_system["backend_procs"][1])
+    time.sleep(0.1)
+
+    result = run_client(1, "ping", env)
+    assert result.returncode == 0
+    assert "Request successful (Status code 0)" in result.stdout
+    assert "content.page" in result.stdout
+    assert "content.stream" in result.stdout
+    # PAGE should show 0% available, STREAM should show 100%
+    assert "content.page: 0%" in result.stdout
+    assert "content.stream: 100%" in result.stdout
+
+
+def test_ping_with_all_backends_down(interop_system):
+    """
+    Test PING response when every backend is down.
+    Ping itself should still succeed (gateway is up) but report 0% availability.
+    """
+    env = interop_system["env"]
+
+    for proc in interop_system["backend_procs"]:
+        stop_process(proc)
+    time.sleep(0.1)
+
+    result = run_client(1, "ping", env)
+    assert result.returncode == 0
+    assert "Request successful (Status code 0)" in result.stdout
+    assert "0%" in result.stdout
 
 def test_page_fails_over_when_primary_proxy_down(interop_system):
     # If the primary proxy goes down, the client should automatically switch to the backup proxy

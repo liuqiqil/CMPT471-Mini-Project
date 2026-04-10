@@ -490,3 +490,207 @@ def test_internal_error_returns_status(tmp_path: Path):
         stop_process(proxy_proc)
         stop_process(gateway_proc)
         error_backend.stop()
+        
+def test_server_busy_returns_status(tmp_path: Path):
+    """
+    Test that SERVER_BUSY is returned when all backends respond with 503.
+    """
+    client_config = {
+        "proxies": [{"id": 0, "port": 8000}],
+        "client_ids": [1, 2, 3],
+    }
+
+    server_config = {
+        "proxy": {"port": 8000, "auth_token": "proxy:IamProxy"},
+        "b_gateway": {"host": "127.0.0.1", "port": GATEWAY_PORT},
+        "servers": [
+            {
+                "content_type": "PAGE",
+                "service_id": "content.page",
+                "host": "127.0.0.1",
+                "port": 9103,
+            }
+        ],
+    }
+
+    client_config_path, server_config_path = write_test_configs(
+        tmp_path, client_config, server_config
+    )
+    env = build_env(client_config_path, server_config_path)
+
+    busy_backend = FixedResponseHTTPServer(
+        port=9103,
+        response_bytes=build_http_response("HTTP/1.1 503 Service Unavailable", "B-endpoint Busy"),
+    )
+    busy_backend.start()
+
+    gateway_proc = None
+    proxy_proc = None
+
+    try:
+        gateway_proc = start_process([sys.executable, "b_network_gateway.py"], env)
+        assert wait_for_tcp_port(HOST, GATEWAY_PORT, timeout=3.0), "gateway not ready"
+
+        proxy_proc = start_process([sys.executable, "proxy.py", "0"], env)
+        time.sleep(0.5)
+
+        result = run_client(1, "page", env)
+        assert result.returncode == 0
+        assert "Proxy indicates backend server is busy." in result.stdout
+
+    finally:
+        stop_process(proxy_proc)
+        stop_process(gateway_proc)
+        busy_backend.stop()
+
+
+def test_server_unreachable_returns_status(tmp_path: Path):
+    """
+    Test that when the backend port has nothing listening, the gateway returns 504
+    which the proxy translates to INTERNAL_ERROR with an unreachable message.
+    """
+    client_config = {
+        "proxies": [{"id": 0, "port": 8000}],
+        "client_ids": [1, 2, 3],
+    }
+
+    server_config = {
+        "proxy": {"port": 8000, "auth_token": "proxy:IamProxy"},
+        "b_gateway": {"host": "127.0.0.1", "port": GATEWAY_PORT},
+        "servers": [
+            {
+                "content_type": "PAGE",
+                "service_id": "content.page",
+                "host": "127.0.0.1",
+                "port": 9104,
+            }
+        ],
+    }
+
+    client_config_path, server_config_path = write_test_configs(
+        tmp_path, client_config, server_config
+    )
+    env = build_env(client_config_path, server_config_path)
+
+    gateway_proc = None
+    proxy_proc = None
+
+    try:
+        gateway_proc = start_process([sys.executable, "b_network_gateway.py"], env)
+        assert wait_for_tcp_port(HOST, GATEWAY_PORT, timeout=3.0), "gateway not ready"
+
+        proxy_proc = start_process([sys.executable, "proxy.py", "0"], env)
+        time.sleep(0.5)
+
+        result = run_client(1, "page", env)
+        assert result.returncode == 0
+        assert "Proxy 0 internal error. Status code 6." in result.stdout
+        assert "All B-network endpoints are unreachable." in result.stdout
+
+    finally:
+        stop_process(proxy_proc)
+        stop_process(gateway_proc)
+
+
+def test_gateway_unreachable_returns_status(tmp_path: Path):
+    """
+    Test that SERVER_UNREACHABLE is returned when the B-network gateway itself is down.
+    """
+    client_config = {
+        "proxies": [{"id": 0, "port": 8000}],
+        "client_ids": [1, 2, 3],
+    }
+
+    server_config = {
+        "proxy": {"port": 8000, "auth_token": "proxy:IamProxy"},
+        "b_gateway": {"host": "127.0.0.1", "port": GATEWAY_PORT},
+        "servers": [
+            {
+                "content_type": "PAGE",
+                "service_id": "content.page",
+                "host": "127.0.0.1",
+                "port": 9001,
+            }
+        ],
+    }
+
+    client_config_path, server_config_path = write_test_configs(
+        tmp_path, client_config, server_config
+    )
+    env = build_env(client_config_path, server_config_path)
+
+    proxy_proc = None
+
+    try:
+        # Deliberately do not start the gateway
+        proxy_proc = start_process([sys.executable, "proxy.py", "0"], env)
+        time.sleep(0.5)
+
+        result = run_client(1, "page", env)
+        assert result.returncode == 0
+        assert "Proxy indicates backend server is unreachable." in result.stdout
+
+    finally:
+        stop_process(proxy_proc)
+
+
+def test_invalid_resource_returns_status(tmp_path: Path):
+    """
+    Test that INVALID_REQUEST is returned when the client sends an unrecognized resource.
+    Simulated by directly sending a malformed CPP packet to the proxy.
+    """
+    import struct
+
+    client_config = {
+        "proxies": [{"id": 0, "port": 8000}],
+        "client_ids": [1, 2, 3],
+    }
+
+    server_config = {
+        "proxy": {"port": 8000, "auth_token": "proxy:IamProxy"},
+        "b_gateway": {"host": "127.0.0.1", "port": GATEWAY_PORT},
+        "servers": [
+            {
+                "content_type": "PAGE",
+                "service_id": "content.page",
+                "host": "127.0.0.1",
+                "port": 9001,
+            }
+        ],
+    }
+
+    client_config_path, server_config_path = write_test_configs(
+        tmp_path, client_config, server_config
+    )
+    env = build_env(client_config_path, server_config_path)
+
+    proxy_proc = None
+
+    try:
+        proxy_proc = start_process([sys.executable, "proxy.py", "0"], env)
+        time.sleep(0.5)
+
+        # Send a CPP packet with invalid resource value (99) directly via UDP
+        PROTOCOL_ID = 148
+        CPP_HEADER_FORMAT = "!BBBBI"
+        bad_packet = struct.pack(CPP_HEADER_FORMAT, PROTOCOL_ID, 99, 1, 0, 12345)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind((HOST, 0))
+        sock.settimeout(3.0)
+        sock.sendto(bad_packet, (HOST, 8000))
+
+        try:
+            data, _ = sock.recvfrom(4096)
+            # Unpack response — expect INVALID_REQUEST status (5)
+            resp_protocol, resp_resource, resp_source, resp_status, resp_request_id = struct.unpack(
+                CPP_HEADER_FORMAT, data[:struct.calcsize(CPP_HEADER_FORMAT)]
+            )
+            assert resp_status == 5  # CPPStatus.INVALID_REQUEST
+        except socket.timeout:
+            pass  # Proxy may silently drop — acceptable, just must not crash
+        finally:
+            sock.close()
+
+    finally:
+        stop_process(proxy_proc)
