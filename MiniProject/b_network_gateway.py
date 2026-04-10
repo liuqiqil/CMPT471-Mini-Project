@@ -267,7 +267,6 @@ def build_status_body() -> str:
 
     for service_id, service_records in grouped.items():
         available = 0
-        busy = 0
         unreachable = 0
 
         for record in service_records:
@@ -290,7 +289,6 @@ def build_status_body() -> str:
         lines.append(
             f"{service_id}: "
             f"{pct(available, total)}% ({available}/{total}) available, "
-            f"{pct(busy, total)}% ({busy}/{total}) busy, "
             f"{pct(unreachable, total)}% ({unreachable}/{total}) unreachable"
         )
 
