@@ -248,8 +248,10 @@ def interop_base_system(tmp_path: Path):
 
     server_config = {
         "proxy": {
-            "port": 8000,
-            "auth_token": "proxy:IamProxy",
+            "port": 8000
+        },
+        "interop_auth": {
+            "token": "interop:BridgeAuth"
         },
         "b_gateway": {
             "host": "127.0.0.1",
@@ -341,8 +343,10 @@ def test_proxy_busy_returns_status(tmp_path: Path):
 
     server_config = {
         "proxy": {
-            "port": 8000,
-            "auth_token": "proxy:IamProxy",
+            "port": 8000
+        },
+        "interop_auth": {
+            "token": "interop:BridgeAuth"
         },
         "b_gateway": {
             "host": "127.0.0.1",
@@ -430,8 +434,10 @@ def test_internal_error_returns_status(tmp_path: Path):
 
     server_config = {
         "proxy": {
-            "port": 8000,
-            "auth_token": "proxy:IamProxy",
+            "port": 8000
+        },
+        "interop_auth": {
+            "token": "interop:BridgeAuth"
         },
         "b_gateway": {
             "host": "127.0.0.1",
@@ -501,7 +507,8 @@ def test_server_busy_returns_status(tmp_path: Path):
     }
 
     server_config = {
-        "proxy": {"port": 8000, "auth_token": "proxy:IamProxy"},
+        "proxy": {"port": 8000},
+        "interop_auth": {"token": "interop:BridgeAuth"},
         "b_gateway": {"host": "127.0.0.1", "port": GATEWAY_PORT},
         "servers": [
             {
@@ -555,7 +562,8 @@ def test_server_unreachable_returns_status(tmp_path: Path):
     }
 
     server_config = {
-        "proxy": {"port": 8000, "auth_token": "proxy:IamProxy"},
+        "proxy": {"port": 8000},
+        "interop_auth": {"token": "interop:BridgeAuth"},
         "b_gateway": {"host": "127.0.0.1", "port": GATEWAY_PORT},
         "servers": [
             {
@@ -602,7 +610,8 @@ def test_gateway_unreachable_returns_status(tmp_path: Path):
     }
 
     server_config = {
-        "proxy": {"port": 8000, "auth_token": "proxy:IamProxy"},
+        "proxy": {"port": 8000},
+        "interop_auth": {"token": "interop:BridgeAuth"},
         "b_gateway": {"host": "127.0.0.1", "port": GATEWAY_PORT},
         "servers": [
             {
@@ -647,7 +656,8 @@ def test_invalid_resource_returns_status(tmp_path: Path):
     }
 
     server_config = {
-        "proxy": {"port": 8000, "auth_token": "proxy:IamProxy"},
+        "proxy": {"port": 8000},
+        "interop_auth": {"token": "interop:BridgeAuth"},
         "b_gateway": {"host": "127.0.0.1", "port": GATEWAY_PORT},
         "servers": [
             {

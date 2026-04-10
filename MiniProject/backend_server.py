@@ -159,7 +159,7 @@ def handle_client_connection(
                 headers[key.strip().lower()] = value.strip()
 
         auth_header = headers.get("authorization")
-        expected_token = "Basic " + base64_encode(config.proxy_auth_token)
+        expected_token = "Basic " + base64_encode(config.interop_auth_token)
 
         if not auth_header:
             client_connection.sendall(

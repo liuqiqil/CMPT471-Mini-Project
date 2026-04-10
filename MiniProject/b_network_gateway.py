@@ -247,7 +247,7 @@ def write_backend_request(
     request = (
         f"GET {path} HTTP/1.1\r\n"
         f"Host: {HOST}\r\n"
-        f"Authorization: Basic {base64_encode(server_config.proxy_auth_token)}\r\n"
+        f"Authorization: Basic {base64_encode(server_config.interop_auth_token)}\r\n"
         f"X-Origin-Network: B_GATEWAY\r\n"
         f"X-B-Service-ID: {service_id}\r\n"
         f"X-B-Session-ID: {b_session_id}\r\n"
@@ -467,7 +467,7 @@ def handle_interop_connection(client_connection: socket.socket) -> None:
                 headers[key.strip().lower()] = value.strip()
 
         auth_header = headers.get("authorization")
-        expected_token = "Basic " + base64_encode(server_config.proxy_auth_token)
+        expected_token = "Basic " + base64_encode(server_config.interop_auth_token)
         if auth_header != expected_token:
             client_connection.sendall(
                 build_standard_http_response(

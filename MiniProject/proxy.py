@@ -213,7 +213,7 @@ def build_gateway_request(
     header_lines = [
         f"GET {path} HTTP/1.1",
         f"Host: {gateway_host}:{gateway_port}",
-        f"Authorization: Basic {base64_encode(server_config.proxy_auth_token)}",
+        f"Authorization: Basic {base64_encode(server_config.interop_auth_token)}",
     ]
 
     if headers:

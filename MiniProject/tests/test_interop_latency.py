@@ -77,8 +77,10 @@ def write_test_configs(tmp_path: Path):
 
     server_config = {
         "proxy": {
-            "port": 8000,
-            "auth_token": "proxy:IamProxy",
+            "port": 8000
+        },
+        "interop_auth": {
+            "token": "interop:BridgeAuth"
         },
         "b_gateway": {
             "host": "127.0.0.1",

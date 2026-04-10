@@ -17,8 +17,8 @@ class ServerNetworkConfig(ConfigBase):
         super().__init__(SERVER_CONFIG_PATH)
 
     @property
-    def proxy_auth_token(self):
-        return self._data["proxy"]["auth_token"]
+    def interop_auth_token(self):
+        return self._data["interop_auth"]["token"]
 
     @property
     def proxy_port(self):
